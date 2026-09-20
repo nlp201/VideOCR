@@ -1,5 +1,6 @@
 # Compilation instructions
 # nuitka-project: --standalone
+# nuitka-project: --no-prefer-source-code
 # nuitka-project: --enable-plugin=tk-inter
 # nuitka-project: --windows-console-mode=disable
 # nuitka-project: --include-windows-runtime-dlls=yes
@@ -24,13 +25,13 @@ import configparser
 import contextlib
 import ctypes
 import datetime
-import io
 import json
 import math
 import os
 import pathlib
 import queue
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -41,14 +42,13 @@ import webbrowser
 from typing import IO, Any, cast
 
 import av
-import numpy as np
+import psgdnd as dnd  # type: ignore
 import psutil  # type: ignore
 import PySimpleGUI as sg  # type: ignore
-from PIL import Image
 from wakepy import keep
 
 if sys.platform == "win32":
-    import PyTaskbar  # type: ignore
+    import PyTaskbar
     from winotify import Notification, audio  # type: ignore
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('VideOCR')
 else:
@@ -139,6 +139,11 @@ def get_gui_scaling_multiplier() -> float | None:
     return None
 
 
+def scaling_value_to_multiplier(value: str) -> float | None:
+    """Converts an internal GUI scaling value (e.g. '1.25' or 'System Default') to its effective multiplier."""
+    return None if value == 'System Default' else float(value)
+
+
 def get_scaled_graph_size(custom_scale: float | None, base_w: int, base_h: int) -> tuple[int, int]:
     """Calculates graph size using a custom scale, falling back to OS DPI if None."""
     scale = custom_scale if custom_scale is not None else get_dpi_scaling()
@@ -222,7 +227,7 @@ DEFAULT_CONF_THRESHOLD = 75
 DEFAULT_SIM_THRESHOLD = 80
 DEFAULT_MAX_MERGE_GAP = 0.1
 DEFAULT_MIN_SUBTITLE_DURATION = 0.2
-DEFAULT_SSIM_THRESHOLD = 92
+DEFAULT_SSIM_THRESHOLD = 94
 DEFAULT_OCR_IMAGE_MAX_WIDTH = 720
 DEFAULT_FRAMES_TO_SKIP = 1
 DEFAULT_TIME_START = "0:00"
@@ -262,7 +267,7 @@ PADDLEOCR_LANGUAGES_LIST = [
     ('Chinese Traditional', 'chinese_cht'), ('Chuvash', 'cv'), ('Croatian', 'hr'),
     ('Czech', 'cs'), ('Danish', 'da'), ('Dargwa', 'dar'), ('Dutch', 'nl'),
     ('English', 'en'), ('Estonian', 'et'), ('Finnish', 'fi'), ('French', 'fr'),
-    ('Galician', 'gl'), ('Georgian', 'ka'), ('German', 'german'), ('Goan Konkani', 'gom'),
+    ('Galician', 'gl'), ('Kannada', 'ka'), ('German', 'german'), ('Goan Konkani', 'gom'),
     ('Greek', 'el'), ('Haryanvi', 'bgc'), ('Hindi', 'hi'), ('Hungarian', 'hu'),
     ('Icelandic', 'is'), ('Indonesian', 'id'), ('Ingush', 'inh'), ('Irish', 'ga'),
     ('Italian', 'it'), ('Japanese', 'japan'), ('Kabardian', 'kbd'), ('Kalmyk', 'xal'),
@@ -543,17 +548,18 @@ def update_gui_text(window: sg.Window, is_paused: bool = False) -> None:
         '-LBL-SUB_POS-': {'text': 'lbl_sub_pos', 'tooltip': 'tip_sub_pos'},
         '-SUBTITLE_POS_COMBO-': {'tooltip': 'tip_sub_pos'},
         '-BTN-HELP-': {'text': 'btn_how_to_use'},
+        '-BTN-OCR-INFO-': {'text': 'btn_info'},
         '-LBL-SEEK-': {'text': 'lbl_seek'},
         '-LBL-CROP_BOX-': {'text': 'lbl_crop_box'},
         '-CROP_COORDS-': {'text': 'crop_not_set'},
         '-TIME_TEXT-': {'text': 'time_text_empty'},
-        '-BTN-RUN-': {'text': 'btn_run'},
+        '-BTN-RUN-': {'text': 'btn_run', 'tooltip': 'tip_copy_command'},
         '-BTN-CANCEL-': {'text': 'btn_cancel'},
         '-BTN-CLEAR_CROP-': {'text': 'btn_clear_crop'},
         '-LBL-PROGRESS-': {'text': 'lbl_progress'},
         '-LBL-LOG-': {'text': 'lbl_log'},
         '-LBL-WHEN_READY-': {'text': 'lbl_when_ready'},
-        '-BTN-ADD-BATCH-': {'text': 'btn_add_to_queue'},
+        '-BTN-ADD-BATCH-': {'text': 'btn_add_to_queue', 'tooltip': 'tip_copy_command'},
         '-BTN-BATCH-ADD-ALL-': {'text': 'btn_add_all_to_queue'},
 
         # Queue Tab
@@ -587,6 +593,7 @@ def update_gui_text(window: sg.Window, is_paused: bool = False) -> None:
         '--ssim_threshold': {'tooltip': 'tip_ssim'},
         '-LBL-OCR_WIDTH-': {'text': 'lbl_ocr_width', 'tooltip': 'tip_ocr_width'},
         '--ocr_image_max_width': {'tooltip': 'tip_ocr_width'},
+        '--disable_stitching': {'text': 'chk_disable_stitching', 'tooltip': 'tip_disable_stitching'},
         '-LBL-FRAMES_SKIP-': {'text': 'lbl_frames_skip', 'tooltip': 'tip_frames_skip'},
         '--frames_to_skip': {'tooltip': 'tip_frames_skip'},
         '-LBL-MIN_DURATION-': {'text': 'lbl_min_duration', 'tooltip': 'tip_min_duration'},
@@ -602,6 +609,12 @@ def update_gui_text(window: sg.Window, is_paused: bool = False) -> None:
         '--use_angle_cls': {'text': 'chk_angle_cls', 'tooltip': 'tip_angle_cls'},
         '--post_processing': {'text': 'chk_post_processing', 'tooltip': 'tip_post_processing'},
         '--use_server_model': {'text': 'chk_server_model', 'tooltip': 'tip_server_model'},
+        '--save_ocr_images': {'text': 'chk_save_ocr_images', 'tooltip': 'tip_save_ocr_images'},
+        '-LBL-OCR_IMAGES_DIR-': {'text': 'lbl_ocr_images_dir', 'tooltip': 'tip_ocr_images_dir'},
+        '--ocr_images_output_dir': {'tooltip': 'tip_ocr_images_dir'},
+        '-BTN-OCR_IMAGES_FOLDER_BROWSE-': {'text': 'btn_browse_folder', 'tooltip': 'tip_ocr_images_dir'},
+        '-RESET_OCR_SETTINGS-': {'text': 'btn_reset_to_defaults'},
+        '-RESET_OCR_SETTINGS_INFO-': {'text': 'btn_info'},
         '-LBL-VIDEOCR_SETTINGS-': {'text': 'lbl_videocr_settings'},
         '-LBL-UI_LANG-': {'text': 'lbl_ui_lang', 'tooltip': 'tip_ui_lang'},
         '-UI_LANG_COMBO-': {'tooltip': 'tip_ui_lang'},
@@ -618,6 +631,8 @@ def update_gui_text(window: sg.Window, is_paused: bool = False) -> None:
         'prevent_system_sleep': {'text': 'chk_prevent_sleep', 'tooltip': 'tip_prevent_sleep'},
         '--normalize_to_simplified_chinese': {'text': 'chk_normalize_chinese', 'tooltip': 'tip_normalize_chinese'},
         '-BTN-CHECK_UPDATE_MANUAL-': {'text': 'btn_check_now'},
+        '-RESET_VIDEOCR_SETTINGS-': {'text': 'btn_reset_to_defaults'},
+        '-RESET_VIDEOCR_SETTINGS_INFO-': {'text': 'btn_info'},
 
         # Tab 3
         '-TAB-ABOUT-': {'text': 'tab_about'},
@@ -680,6 +695,14 @@ def update_gui_text(window: sg.Window, is_paused: bool = False) -> None:
 
     current_scale_idx = window['gui_scaling'].Widget.current()
     update_gui_scaling_combo(window, current_scale_idx)
+
+    for reset_key in OCR_SETTINGS_RESET_KEYS + VIDEOCR_SETTINGS_RESET_KEYS:
+        if reset_key in window.AllKeysDict:
+            window[reset_key].set_right_click_menu(make_reset_menu(reset_key))
+
+    for cmd_key in ('-BTN-RUN-', '-BTN-ADD-BATCH-'):
+        if cmd_key in window.AllKeysDict:
+            window[cmd_key].set_right_click_menu(make_copy_command_menu())
 
 
 # --- Helper Functions ---
@@ -1001,6 +1024,13 @@ def update_alignment_controls(window: sg.Window, values: dict[str, Any]) -> None
     window['--subtitle_alignment2'].update(disabled=not (is_checked and is_dual_zone))
 
 
+def update_ocr_images_controls(window: sg.Window, values: dict[str, Any]) -> None:
+    """Enables/disables the OCR images output directory controls based on the Save OCR Images checkbox."""
+    is_checked = values.get('--save_ocr_images', False)
+    window['--ocr_images_output_dir'].update(disabled=not is_checked, readonly=True)
+    window['-BTN-OCR_IMAGES_FOLDER_BROWSE-'].update(disabled=not is_checked)
+
+
 def update_post_action_combo(window: sg.Window, selected_index: int = 0) -> None:
     """Refreshes the Post Action combo text and selects by numeric index."""
     display_values = [LANG.get(key, DEFAULT_ACTION_TEXTS[key]) for key in POST_ACTION_KEYS]
@@ -1054,6 +1084,7 @@ def get_default_settings() -> dict[str, Any]:
     '--brightness_threshold': '',
     '--ssim_threshold': str(DEFAULT_SSIM_THRESHOLD),
     '--ocr_image_max_width': str(DEFAULT_OCR_IMAGE_MAX_WIDTH),
+    '--disable_stitching': False,
     '--frames_to_skip': str(DEFAULT_FRAMES_TO_SKIP),
     '--use_fullframe': False,
     '--use_gpu': True,
@@ -1061,6 +1092,8 @@ def get_default_settings() -> dict[str, Any]:
     '--post_processing': False,
     '--min_subtitle_duration': str(DEFAULT_MIN_SUBTITLE_DURATION),
     '--use_server_model': False,
+    '--save_ocr_images': False,
+    '--ocr_images_output_dir': DEFAULT_DOCUMENTS_DIR,
     '--use_dual_zone': False,
     'enable_subtitle_alignment': False,
     '--subtitle_alignment': DEFAULT_SUBTITLE_ALIGNMENT,
@@ -1076,6 +1109,144 @@ def get_default_settings() -> dict[str, Any]:
     '--normalize_to_simplified_chinese': True,
     'gui_scaling': 'System Default',
     }
+
+
+# --- "Reset to Default" groupings ---
+OCR_SETTINGS_RESET_KEYS = [
+    '--time_start', '--time_end', '--conf_threshold', '--sim_threshold', '--max_merge_gap',
+    '--brightness_threshold', '--ssim_threshold', '--ocr_image_max_width', '--disable_stitching',
+    '--frames_to_skip', '--min_subtitle_duration', '--use_gpu', '--use_fullframe', '--use_dual_zone',
+    'enable_subtitle_alignment', '--subtitle_alignment', '--subtitle_alignment2', '--use_angle_cls',
+    '--post_processing', '--normalize_to_simplified_chinese', '--use_server_model',
+    '--save_ocr_images', '--ocr_images_output_dir',
+]
+
+VIDEOCR_SETTINGS_RESET_KEYS = [
+    '-UI_LANG_COMBO-', 'gui_scaling', '--save_crop_box', '--save_in_video_dir',
+    '--default_output_dir', '--keyboard_seek_step', '--send_notification',
+    'prevent_system_sleep', '--check_for_updates',
+]
+
+
+def make_reset_menu(key: str) -> list[Any]:
+    """Builds a single-item right-click menu that resets one setting to its default value."""
+    return ['', [f"{LANG.get('menu_reset_default', 'Reset to Default')}::{key}"]]
+
+
+def make_copy_command_menu() -> list[Any]:
+    """Builds the right-click menu that copies the equivalent CLI command to the clipboard."""
+    return ['', [f"{LANG.get('menu_copy_command', 'Copy Command')}::COPY_CLI_COMMAND"]]
+
+
+def apply_ui_language_change(window: sg.Window, selected_native_name: str) -> None:
+    """Switches the active UI language and refreshes all translated GUI text/tooltips."""
+    lang_code = available_languages.get(selected_native_name)
+    if not lang_code:
+        return
+
+    current_resume_text = LANG.get('btn_resume', "Resume")
+    was_paused = window['-BTN-PAUSE-'].get_text() == current_resume_text
+
+    selected_pos_display_name = window['-SUBTITLE_POS_COMBO-'].Widget.get()
+    pos_display_to_internal_map = {LANG.get(lang_key, lang_key): internal_val for lang_key, internal_val in SUBTITLE_POSITIONS_LIST}
+    saved_internal_pos = pos_display_to_internal_map.get(selected_pos_display_name, DEFAULT_INTERNAL_SUBTITLE_POSITION)
+
+    load_language(lang_code)
+    update_gui_text(window, is_paused=was_paused)
+
+    update_subtitle_pos_combo(window, saved_internal_pos)
+
+    if video_path:
+        update_time_display(window, current_time_ms, video_duration_ms)
+
+
+def apply_gui_scaling_change(window: sg.Window, selected_display_value: str) -> bool:
+    """Switches the GUI scaling factor if required."""
+    scale_display_to_internal_map = {LANG.get(lang_key, internal_val): internal_val for lang_key, internal_val in GUI_SCALING_LIST}
+    selected_internal_value = scale_display_to_internal_map.get(selected_display_value, DEFAULT_GUI_SCALING)
+
+    if scaling_value_to_multiplier(selected_internal_value) == gui_scale_multiplier:
+        return False
+
+    title = LANG.get('title_restart', "Restart Required")
+    message = LANG.get('msg_restart_scaling', "The scaling factor has been updated.\nWould you like to restart the application now to apply this change?")
+    restart_choice = custom_popup_yes_no(window, title, message, icon=ICON_PATH)
+
+    if restart_choice != 'Yes':
+        internal_to_display_map = {internal_val: LANG.get(lang_key, internal_val) for lang_key, internal_val in GUI_SCALING_LIST}
+        active_internal_value = next((v for _, v in GUI_SCALING_LIST if scaling_value_to_multiplier(v) == gui_scale_multiplier), DEFAULT_GUI_SCALING)
+        window['gui_scaling'].update(value=internal_to_display_map.get(active_internal_value, active_internal_value))
+
+        current_values = window.read(timeout=0)[1]
+        update_alignment_controls(window, current_values)
+        update_ocr_images_controls(window, current_values)
+        save_settings(window, current_values)
+        return False
+
+    video_manager.close()
+    set_system_awake(False)
+
+    process_to_kill = getattr(window, '_videocr_process_pid', None)
+    if process_to_kill:
+        try:
+            kill_process_tree(process_to_kill)
+        except Exception as e:
+            log_error(f"Exception during restart process kill: {e}")
+
+    if sys.argv[0].endswith('.py') or sys.argv[0].endswith('.pyw'):
+        # Uncompiled: Needs the python interpreter + script name
+        restart_cmd = [sys.executable] + sys.argv
+    else:
+        # Compiled: sys.argv[0] is already the compiled executable
+        restart_cmd = sys.argv
+
+    subprocess.Popen(restart_cmd)
+    return True
+
+
+def reset_settings_to_default(window: sg.Window, keys: list[str]) -> bool:
+    """Resets the given setting keys to their default values and updates the GUI/config accordingly."""
+    defaults = get_default_settings()
+
+    if '--subtitle_alignment' in keys or '--subtitle_alignment2' in keys:
+        current_idx1 = window['--subtitle_alignment'].Widget.current()
+        current_idx2 = window['--subtitle_alignment2'].Widget.current()
+        new_idx1 = get_alignment_index(defaults['--subtitle_alignment']) if '--subtitle_alignment' in keys else current_idx1
+        new_idx2 = get_alignment_index(defaults['--subtitle_alignment2']) if '--subtitle_alignment2' in keys else current_idx2
+        update_alignment_combos(window, new_idx1, new_idx2)
+
+    pending_scaling_display: str | None = None
+    pending_language_display: str | None = None
+
+    for key in keys:
+        if key in ('--subtitle_alignment', '--subtitle_alignment2'):
+            continue
+
+        elif key == 'gui_scaling':
+            internal_to_display_map = {internal_val: LANG.get(lang_key, internal_val) for lang_key, internal_val in GUI_SCALING_LIST}
+            display_val = internal_to_display_map.get(defaults['gui_scaling'], defaults['gui_scaling'])
+            window['gui_scaling'].update(value=display_val)
+            pending_scaling_display = display_val
+
+        elif key == '-UI_LANG_COMBO-':
+            code_to_native_name_map = {v: k for k, v in available_languages.items()}
+            display_lang = code_to_native_name_map.get(defaults['--language'], 'English')
+            if window['-UI_LANG_COMBO-'].Widget.get() != display_lang:
+                window['-UI_LANG_COMBO-'].update(value=display_lang)
+                pending_language_display = display_lang
+
+        elif key in window.AllKeysDict:
+            window[key].update(defaults[key])
+
+    if pending_language_display is not None:
+        apply_ui_language_change(window, pending_language_display)
+
+    current_values = window.read(timeout=0)[1]
+    update_alignment_controls(window, current_values)
+    update_ocr_images_controls(window, current_values)
+    save_settings(window, current_values)
+
+    return pending_scaling_display is not None and apply_gui_scaling_change(window, pending_scaling_display)
 
 
 def save_settings(window: sg.Window, values: dict[str, Any]) -> None:
@@ -1170,7 +1341,7 @@ def load_settings(window: sg.Window) -> None:
                 window['-OCR_ENGINE_COMBO-'].update(value=saved_engine)
 
                 active_lang_list = lens_display_names if "Google Lens" in saved_engine else paddle_display_names
-                window['-LANG_COMBO-'].update(values=active_lang_list)
+                window['-LANG_COMBO-'].update(values=active_lang_list, value=DEFAULT_SUBTITLE_LANGUAGE)
 
                 settings_to_load = [
                     ('-LANG_COMBO-', 'combo_lang'),
@@ -1182,6 +1353,7 @@ def load_settings(window: sg.Window) -> None:
                     ('--brightness_threshold', 'input'),
                     ('--ssim_threshold', 'input'),
                     ('--ocr_image_max_width', 'input'),
+                    ('--disable_stitching', 'checkbox'),
                     ('--frames_to_skip', 'input'),
                     ('--use_fullframe', 'checkbox'),
                     ('--use_gpu', 'checkbox'),
@@ -1199,6 +1371,8 @@ def load_settings(window: sg.Window) -> None:
                     ('--check_for_updates', 'checkbox'),
                     ('prevent_system_sleep', 'checkbox'),
                     ('--normalize_to_simplified_chinese', 'checkbox'),
+                    ('--save_ocr_images', 'checkbox'),
+                    ('--ocr_images_output_dir', 'input'),
                 ]
 
                 for key, elem_type in settings_to_load:
@@ -1231,6 +1405,7 @@ def load_settings(window: sg.Window) -> None:
 
             current_gui_values = window.read(timeout=0)[1]
             update_alignment_controls(window, current_gui_values)
+            update_ocr_images_controls(window, current_gui_values)
             save_settings(window, current_gui_values)
 
         except configparser.Error as e:
@@ -1302,45 +1477,79 @@ class VideoHandler:
         self.height: int = 0
         self.duration_ms: int = 0
 
+        self.newly_opened: bool = False
         self.last_pts: int | None = None
 
         self.graph: av.filter.Graph | None = None
         self.buffer_node: Any = None
         self.sink_node: Any = None
         self.last_display_size: tuple[int, int] = (0, 0)
+        self.last_threshold: int | None = None
         self.current_new_w: int = 0
         self.current_new_h: int = 0
-
-        self._supports_threads = True
-
-    def _frame_to_array(self, frame: av.VideoFrame, fmt: str) -> np.ndarray[Any, Any]:
-        """Converts a frame to an array, safely falls back if threads arg is unsupported."""
-        if self._supports_threads:
-            try:
-                return frame.to_ndarray(format=fmt, threads=1)
-            except TypeError:
-                self._supports_threads = False
-
-        return frame.to_ndarray(format=fmt)
 
     def _get_cached_properties(self) -> dict[str, int]:
         """Returns internal properties without re-parsing the file."""
         return {'width': self.width, 'height': self.height, 'duration_ms': self.duration_ms}
 
-    def _setup_filter_graph(self, template_frame: av.VideoFrame, display_size: tuple[int, int]) -> None:
-        """Initializes the FFmpeg filter graph for fast resizing and format conversion."""
+    def _setup_filter_graph(self, template_frame: av.VideoFrame, display_size: tuple[int, int], threshold: int | None) -> None:
+        """Initializes the FFmpeg filter graph for resizing, format conversion, and optional brightness masking."""
         scale = min(display_size[0] / self.width, display_size[1] / self.height)
         self.current_new_w, self.current_new_h = int(self.width * scale) & ~1, int(self.height * scale) & ~1
 
         self.graph = av.filter.Graph()
         self.buffer_node = self.graph.add_buffer(template=cast(Any, template_frame))
-        scale_node = self.graph.add("scale", f"{self.current_new_w}:{self.current_new_h}:flags=bicubic")
-        self.sink_node = self.graph.add("buffersink")
+        last = self.graph.add("scale", f"{self.current_new_w}:{self.current_new_h}:flags=bicubic")
+        self.buffer_node.link_to(last)
 
-        self.buffer_node.link_to(scale_node)
-        scale_node.link_to(self.sink_node)
+        fmt_base_node = self.graph.add("format", "rgb24")
+        last.link_to(fmt_base_node)
+        last = fmt_base_node
+
+        if threshold is not None:
+            split_node = self.graph.add("split", "2")
+            last.link_to(split_node)
+
+            gray_node = self.graph.add("format", "gray")
+            split_node.link_to(gray_node, output_idx=0)
+
+            lut_node = self.graph.add("lut", f"c0='255*gt(val,{threshold})'")
+            gray_node.link_to(lut_node)
+
+            mask_rgb_node = self.graph.add("format", "rgb24")
+            lut_node.link_to(mask_rgb_node)
+
+            blend_node = self.graph.add("blend", "all_mode=multiply")
+            split_node.link_to(blend_node, output_idx=1)
+            mask_rgb_node.link_to(blend_node, input_idx=1)
+            last = blend_node
+
+            fmt_out_node = self.graph.add("format", "rgb24")
+            last.link_to(fmt_out_node)
+            last = fmt_out_node
+
+        self.sink_node = self.graph.add("buffersink")
+        last.link_to(self.sink_node)
         self.graph.configure()
         self.last_display_size = display_size
+        self.last_threshold = threshold
+
+    def _frame_to_ppm(self, frame: av.VideoFrame) -> bytes:
+        """Encodes an rgb24 frame as a binary PPM (P6) image, handling any plane stride padding."""
+        w, h = frame.width, frame.height
+        plane = frame.planes[0]
+        row_bytes = w * 3
+        stride = plane.line_size
+        mv = memoryview(plane)
+
+        if stride == row_bytes:
+            data = bytes(mv)
+        else:
+            rows = [mv[y * stride: y * stride + row_bytes] for y in range(h)]
+            data = b''.join(rows)
+
+        header = f"P6\n{w} {h}\n255\n".encode('ascii')
+        return header + data
 
     def open(self, path: str) -> dict[str, int]:
         if self.path == path and self.container:
@@ -1354,6 +1563,7 @@ class VideoHandler:
             self.path = path
             self.width = int(self.stream.width)
             self.height = int(self.stream.height)
+            self.newly_opened = True
 
             if self.container.duration is not None:
                 self.duration_ms = int(self.container.duration / 1000.0)
@@ -1367,7 +1577,7 @@ class VideoHandler:
             self.close()
             return {'width': 0, 'height': 0, 'duration_ms': 0}
 
-    def get_frame(self, timestamp_ms: float, display_size: tuple[int, int], brightness_threshold: int | None = None) -> tuple[io.BytesIO | None, int, int, int, int]:
+    def get_frame(self, timestamp_ms: float, display_size: tuple[int, int], brightness_threshold: int | None = None) -> tuple[bytes | None, int, int, int, int]:
         """Seeks or decodes forward to provide a frame at the requested timestamp."""
         if not self.container or not self.stream:
             return None, 0, 0, 0, 0
@@ -1383,13 +1593,28 @@ class VideoHandler:
             seek_threshold = int(1.5 / tb)
 
             should_seek = True
-            if self.last_pts is not None:
+
+            if self.newly_opened and timestamp_ms == 0:
+                should_seek = False
+            elif self.last_pts is not None:
                 if self.last_pts <= target_pts <= (self.last_pts + seek_threshold):
                     should_seek = False
 
+            self.newly_opened = False
+
             if should_seek:
-                self.container.seek(target_pts, stream=self.stream)
-                self.last_pts = None
+                try:
+                    self.container.seek(target_pts, stream=self.stream)
+                    self.last_pts = None
+                except Exception as e:
+                    if target_pts <= 0 and getattr(e, 'errno', None) == 1:
+                        saved_path = self.path
+                        self.close()
+                        if saved_path:
+                            self.open(saved_path)
+                        self.newly_opened = False
+                    else:
+                        raise
 
             frame: av.VideoFrame | None = None
             for f in self.container.decode(self.stream):
@@ -1401,31 +1626,17 @@ class VideoHandler:
             if not frame:
                 return None, 0, 0, 0, 0
 
-            if self.graph is None or self.last_display_size != display_size:
-                self._setup_filter_graph(frame, display_size)
+            if self.graph is None or self.last_display_size != display_size or self.last_threshold != brightness_threshold:
+                self._setup_filter_graph(frame, display_size, brightness_threshold)
 
             off_x = (display_size[0] - self.current_new_w) // 2
             off_y = (display_size[1] - self.current_new_h) // 2
 
             self.buffer_node.push(frame)
             processed_frame: av.VideoFrame = self.sink_node.pull()
+            img_bytes = self._frame_to_ppm(processed_frame)
 
-            img_np = self._frame_to_array(processed_frame, fmt='rgb24')
-
-            if brightness_threshold is not None:
-                gray = (
-                    (img_np[..., 0].astype(np.uint16) * 77 +
-                    img_np[..., 1].astype(np.uint16) * 150 +
-                    img_np[..., 2].astype(np.uint16) * 29) >> 8
-                ).astype(np.uint8)
-                mask = gray > brightness_threshold
-                img_np *= mask[..., None]
-
-            pil_img = Image.fromarray(img_np)
-            img_byte_arr = io.BytesIO()
-            pil_img.save(img_byte_arr, format='PNG')
-
-            return io.BytesIO(img_byte_arr.getvalue()), self.current_new_w, self.current_new_h, off_x, off_y
+            return img_bytes, self.current_new_w, self.current_new_h, off_x, off_y
 
         except Exception as e:
             log_error(f"VideoHandler Seek Error: {e}")
@@ -1438,7 +1649,9 @@ class VideoHandler:
         self.container = self.stream = self.path = self.graph = self.buffer_node = self.sink_node = None
         self.width = self.height = 0
         self.duration_ms = 0
+        self.last_pts = None
         self.last_display_size = (0, 0)
+        self.last_threshold = None
         self.current_new_w = self.current_new_h = 0
 
 
@@ -1750,14 +1963,9 @@ def get_valid_brightness_threshold(value: Any) -> int | None:
     return None
 
 
-def run_videocr(args_dict: dict[str, Any], window: sg.Window) -> bool:
-    """Runs the videocr-cli tool in a separate process and streams output."""
-    if not VIDEOCR_PATH:
-        error_msg = LANG.get('error_cli_not_found', "\nError: videocr-cli not found. Please check the path.\n")
-        gui_queue.put(('-VIDEOCR_OUTPUT-', error_msg))
-        return False
-
-    command = [VIDEOCR_PATH]
+def build_cli_command(args_dict: dict[str, Any]) -> list[str]:
+    """Builds the videocr-cli command-line argument list from a processing args dict."""
+    command = [cast(str, VIDEOCR_PATH)]
 
     for key, value in args_dict.items():
         if value is not None and value != '':
@@ -1768,6 +1976,25 @@ def run_videocr(args_dict: dict[str, Any], window: sg.Window) -> bool:
                     command.append(str(value).lower())
                 else:
                     command.append(str(value))
+
+    return command
+
+
+def command_to_shell_string(command: list[str]) -> str:
+    """Formats a command list into a paste-ready string, quoted for the current OS's shell."""
+    if sys.platform == 'win32':
+        return subprocess.list2cmdline(command)
+    return shlex.join(command)
+
+
+def run_videocr(args_dict: dict[str, Any], window: sg.Window) -> bool:
+    """Runs the videocr-cli tool in a separate process and streams output."""
+    if not VIDEOCR_PATH:
+        error_msg = LANG.get('error_cli_not_found', "\nError: videocr-cli not found. Please check the path.\n")
+        gui_queue.put(('-VIDEOCR_OUTPUT-', error_msg))
+        return False
+
+    command = build_cli_command(args_dict)
 
     UNSUPPORTED_HARDWARE_ERROR_PATTERN = re.compile(r"Unsupported Hardware Error: (.*)")
     WARNING_HARDWARE_PATTERN = re.compile(r"Hardware Check Warning: (.*)")
@@ -1781,6 +2008,7 @@ def run_videocr(args_dict: dict[str, Any], window: sg.Window) -> bool:
     FILTERED_PATTERN = re.compile(r"Filtered out (\d+) redundant frame\(s\) via Text-Detection and tight-box SSIM analysis\.")
     GENERATING_SUBTITLES_PATTERN = re.compile(r"Generating subtitles\.\.\.")
     REACHED_END_TIME_PATTERN = re.compile(r"Reached end time\. Stopping\.")
+    LENS_NO_REC_IMAGES_PATTERN = re.compile(r"Note: Google Lens doesn't support saving recognition images yet; only detection images will be saved\.")
 
     last_reported_percentage_step1 = -1.0
     last_reported_percentage_step2 = -1.0
@@ -1913,6 +2141,10 @@ def run_videocr(args_dict: dict[str, Any], window: sg.Window) -> bool:
                 if REACHED_END_TIME_PATTERN.search(line):
                     gui_queue.put(('-VIDEOCR_OUTPUT-', LANG.get('log_reached_end', line) + '\n'))
                     gui_queue.put(('-PROGRESS-SMOOTH-', {'text': LANG.get('log_reached_end', line), 'percent': None}))
+                    continue
+                if LENS_NO_REC_IMAGES_PATTERN.search(line):
+                    note_msg = LANG.get('cli_note_lens_no_rec_images', "Note: Google Lens doesn't support saving recognition images yet; only detection images will be saved.")
+                    gui_queue.put(('-VIDEOCR_OUTPUT-', '\n' + note_msg + '\n'))
                     continue
                 if STARTING_PADDLEOCR_PATTERN.search(line):
                     gui_queue.put(('-VIDEOCR_OUTPUT-', LANG.get('cli_starting_paddleocr', line) + '\n'))
@@ -2289,11 +2521,11 @@ tab1_content = [
         sg.Text("Time: -/-", key="-TIME_TEXT-")
     ],
     [sg.Text("Crop Box (X, Y, W, H):", key='-LBL-CROP_BOX-'), sg.Text("Not Set", key="-CROP_COORDS-", size=(45, 1), expand_x=True)],
-    [sg.Button("Run", key="-BTN-RUN-"),
+    [sg.Button("Run", key="-BTN-RUN-", right_click_menu=make_copy_command_menu()),
      sg.Button("Pause", key="-BTN-PAUSE-", disabled=True),
      sg.Button("Cancel", key="-BTN-CANCEL-", disabled=True),
      sg.Button("Clear Crop", key="-BTN-CLEAR_CROP-", disabled=True)],
-    [sg.Button("Add to Queue", key="-BTN-ADD-BATCH-"),
+    [sg.Button("Add to Queue", key="-BTN-ADD-BATCH-", right_click_menu=make_copy_command_menu()),
      sg.Button("Add All to Queue", key="-BTN-BATCH-ADD-ALL-")],
     [sg.Text("Progress Info:", key='-LBL-PROGRESS-')],
     [
@@ -2338,58 +2570,67 @@ tab_batch_layout = [[sg.Column(tab_batch_content, expand_x=True, expand_y=True)]
 tab2_content = [
     [sg.Text("OCR Settings:", font=("Arial", scale_font_size(10), "bold"), key='-LBL-OCR_SETTINGS-')],
     [sg.Text("Start Time (e.g., 0:00 or 1:23:45):", size=(38, 1), key='-LBL-TIME_START-'),
-     sg.Input(DEFAULT_TIME_START, key="--time_start", size=(15, 1), enable_events=True)],
+     sg.Input(DEFAULT_TIME_START, key="--time_start", size=(15, 1), enable_events=True, right_click_menu=make_reset_menu("--time_start"))],
     [sg.Text("End Time (e.g., 0:10 or 2:34:56):", size=(38, 1), key='-LBL-TIME_END-'),
-     sg.Input("", key="--time_end", size=(15, 1), enable_events=True)],
+     sg.Input("", key="--time_end", size=(15, 1), enable_events=True, right_click_menu=make_reset_menu("--time_end"))],
     [sg.Text("Confidence Threshold (0-100):", size=(38, 1), key='-LBL-CONF_THRESHOLD-'),
-     sg.Input(DEFAULT_CONF_THRESHOLD, key="--conf_threshold", size=(10, 1), enable_events=True)],
+     sg.Input(DEFAULT_CONF_THRESHOLD, key="--conf_threshold", size=(10, 1), enable_events=True, right_click_menu=make_reset_menu("--conf_threshold"))],
     [sg.Text("Similarity Threshold (0-100):", size=(38, 1), key='-LBL-SIM_THRESHOLD-'),
-     sg.Input(DEFAULT_SIM_THRESHOLD, key="--sim_threshold", size=(10, 1), enable_events=True)],
+     sg.Input(DEFAULT_SIM_THRESHOLD, key="--sim_threshold", size=(10, 1), enable_events=True, right_click_menu=make_reset_menu("--sim_threshold"))],
     [sg.Text("Max Merge Gap (seconds):", size=(38, 1), key='-LBL-MERGE_GAP-'),
-     sg.Input(DEFAULT_MAX_MERGE_GAP, key="--max_merge_gap", size=(10, 1), enable_events=True)],
+     sg.Input(DEFAULT_MAX_MERGE_GAP, key="--max_merge_gap", size=(10, 1), enable_events=True, right_click_menu=make_reset_menu("--max_merge_gap"))],
     [sg.Text("Brightness Threshold (0-255):", size=(38, 1), key='-LBL-BRIGHTNESS-'),
-     sg.Input("", key="--brightness_threshold", size=(10, 1), enable_events=True)],
+     sg.Input("", key="--brightness_threshold", size=(10, 1), enable_events=True, right_click_menu=make_reset_menu("--brightness_threshold"))],
     [sg.Text("SSIM Threshold (0-100):", size=(38, 1), key='-LBL-SSIM-'),
-     sg.Input(DEFAULT_SSIM_THRESHOLD, key="--ssim_threshold", size=(10, 1), enable_events=True)],
+     sg.Input(DEFAULT_SSIM_THRESHOLD, key="--ssim_threshold", size=(10, 1), enable_events=True, right_click_menu=make_reset_menu("--ssim_threshold"))],
     [sg.Text("Max OCR Image Width (pixel):", size=(38, 1), key='-LBL-OCR_WIDTH-'),
-     sg.Input(DEFAULT_OCR_IMAGE_MAX_WIDTH, key="--ocr_image_max_width", size=(10, 1), enable_events=True)],
+     sg.Input(DEFAULT_OCR_IMAGE_MAX_WIDTH, key="--ocr_image_max_width", size=(10, 1), enable_events=True, right_click_menu=make_reset_menu("--ocr_image_max_width"))],
+    [sg.Checkbox("Disable Frame Stitching", default=False, key="--disable_stitching", enable_events=True, right_click_menu=make_reset_menu("--disable_stitching"))],
     [sg.Text("Frames to Skip:", size=(38, 1), key='-LBL-FRAMES_SKIP-'),
-     sg.Input(DEFAULT_FRAMES_TO_SKIP, key="--frames_to_skip", size=(10, 1), enable_events=True)],
+     sg.Input(DEFAULT_FRAMES_TO_SKIP, key="--frames_to_skip", size=(10, 1), enable_events=True, right_click_menu=make_reset_menu("--frames_to_skip"))],
     [sg.Text("Minimum Subtitle Duration (seconds):", size=(38, 1), key='-LBL-MIN_DURATION-'),
-     sg.Input(DEFAULT_MIN_SUBTITLE_DURATION, key="--min_subtitle_duration", size=(10, 1), enable_events=True)],
-    [sg.Checkbox("Enable GPU Usage", default=True, key="--use_gpu", enable_events=True)],
-    [sg.Checkbox("Use Full Frame OCR", default=False, key="--use_fullframe", enable_events=True)],
-    [sg.Checkbox("Enable Dual Zone OCR", default=False, key="--use_dual_zone", enable_events=True)],
-    [sg.Checkbox("Enable Subtitle Alignment", default=False, key="enable_subtitle_alignment", enable_events=True)],
+     sg.Input(DEFAULT_MIN_SUBTITLE_DURATION, key="--min_subtitle_duration", size=(10, 1), enable_events=True, right_click_menu=make_reset_menu("--min_subtitle_duration"))],
+    [sg.Checkbox("Enable GPU Usage", default=True, key="--use_gpu", enable_events=True, right_click_menu=make_reset_menu("--use_gpu"))],
+    [sg.Checkbox("Use Full Frame OCR", default=False, key="--use_fullframe", enable_events=True, right_click_menu=make_reset_menu("--use_fullframe"))],
+    [sg.Checkbox("Enable Dual Zone OCR", default=False, key="--use_dual_zone", enable_events=True, right_click_menu=make_reset_menu("--use_dual_zone"))],
+    [sg.Checkbox("Enable Subtitle Alignment", default=False, key="enable_subtitle_alignment", enable_events=True, right_click_menu=make_reset_menu("enable_subtitle_alignment"))],
     [sg.Text("Zone 1 Alignment:", size=(38, 1), key='-LBL-SUBTITLE-ALIGNMENT-'),
-     sg.Combo([], key="--subtitle_alignment", size=(15, 1), readonly=True, enable_events=True, disabled=True)],
+     sg.Combo([], key="--subtitle_alignment", size=(15, 1), readonly=True, enable_events=True, disabled=True, right_click_menu=make_reset_menu("--subtitle_alignment"))],
     [sg.Text("Zone 2 Alignment:", size=(38, 1), key='-LBL-SUBTITLE-ALIGNMENT2-'),
-     sg.Combo([], key="--subtitle_alignment2", size=(15, 1), readonly=True, enable_events=True, disabled=True)],
-    [sg.Checkbox("Enable Angle Classification", default=False, key="--use_angle_cls", enable_events=True)],
-    [sg.Checkbox("Enable Post Processing", default=False, key="--post_processing", enable_events=True)],
-    [sg.Checkbox("Normalize Traditional to Simplified Chinese", default=True, key="--normalize_to_simplified_chinese", enable_events=True)],
-    [sg.Checkbox("Use Server Model", default=False, key="--use_server_model", enable_events=True)],
+     sg.Combo([], key="--subtitle_alignment2", size=(15, 1), readonly=True, enable_events=True, disabled=True, right_click_menu=make_reset_menu("--subtitle_alignment2"))],
+    [sg.Checkbox("Enable Angle Classification", default=False, key="--use_angle_cls", enable_events=True, right_click_menu=make_reset_menu("--use_angle_cls"))],
+    [sg.Checkbox("Enable Post Processing", default=False, key="--post_processing", enable_events=True, right_click_menu=make_reset_menu("--post_processing"))],
+    [sg.Checkbox("Normalize Traditional to Simplified Chinese", default=True, key="--normalize_to_simplified_chinese", enable_events=True, right_click_menu=make_reset_menu("--normalize_to_simplified_chinese"))],
+    [sg.Checkbox("Use Server Model", default=False, key="--use_server_model", enable_events=True, right_click_menu=make_reset_menu("--use_server_model"))],
+    [sg.Checkbox("Save OCR Images (Detection/OCR)", default=False, key="--save_ocr_images", enable_events=True, right_click_menu=make_reset_menu("--save_ocr_images"))],
+    [sg.Text("OCR Images Output Directory:", size=(38, 1), key='-LBL-OCR_IMAGES_DIR-'),
+     sg.Input(DEFAULT_DOCUMENTS_DIR, key="--ocr_images_output_dir", disabled_readonly_background_color=sg.theme_input_background_color(), readonly=True, disabled=True, size=(24, 1), enable_events=True, right_click_menu=make_reset_menu("--ocr_images_output_dir")),
+     sg.Button("Open Folder...", key="-BTN-OCR_IMAGES_FOLDER_BROWSE-", disabled=True)],
+    [sg.Push(),
+     sg.Button("Reset to Defaults", key="-RESET_OCR_SETTINGS-", pad=((5, 5), (15, 3))),
+     sg.Button("Info", key="-RESET_OCR_SETTINGS_INFO-", pad=((5, 5), (15, 3))),
+     sg.Push()],
     [sg.HorizontalSeparator()],
     [sg.Text("VideOCR Settings:", font=("Arial", scale_font_size(10), "bold"), key='-LBL-VIDEOCR_SETTINGS-')],
     [
         sg.Column([
             [sg.Text("UI Language:", size=(30, 1), key='-LBL-UI_LANG-'), VerticalStrut()],
             [sg.Text("GUI Scaling:", size=(30, 1), key='-LBL-GUI_SCALING-'), VerticalStrut()],
-            [sg.Checkbox("Save Crop Box Selection", default=True, key="--save_crop_box", enable_events=True), VerticalStrut()],
-            [sg.Checkbox("Save SRT in Video Directory", default=True, key="--save_in_video_dir", enable_events=True), VerticalStrut()],
+            [sg.Checkbox("Save Crop Box Selection", default=True, key="--save_crop_box", enable_events=True, right_click_menu=make_reset_menu("--save_crop_box")), VerticalStrut()],
+            [sg.Checkbox("Save SRT in Video Directory", default=True, key="--save_in_video_dir", enable_events=True, right_click_menu=make_reset_menu("--save_in_video_dir")), VerticalStrut()],
             [sg.Text("Output Directory:", size=(30, 1), key='-LBL-OUTPUT_DIR-'), VerticalStrut()],
             [sg.Text("Keyboard Seek Step (seconds):", size=(30, 1), key='-LBL-SEEK_STEP-'), VerticalStrut()],
-            [sg.Checkbox("Send Notification", default=True, key="--send_notification", enable_events=True), VerticalStrut()],
-            [sg.Checkbox("Prevent System Sleep", default=True, key="prevent_system_sleep", enable_events=True), VerticalStrut()],
-            [sg.Checkbox("Check for Updates On Startup", default=True, key="--check_for_updates", enable_events=True), VerticalStrut()],
+            [sg.Checkbox("Send Notification", default=True, key="--send_notification", enable_events=True, right_click_menu=make_reset_menu("--send_notification")), VerticalStrut()],
+            [sg.Checkbox("Prevent System Sleep", default=True, key="prevent_system_sleep", enable_events=True, right_click_menu=make_reset_menu("prevent_system_sleep")), VerticalStrut()],
+            [sg.Checkbox("Check for Updates On Startup", default=True, key="--check_for_updates", enable_events=True, right_click_menu=make_reset_menu("--check_for_updates")), VerticalStrut()],
         ], pad=(0, None)),
         sg.Column([
-            [sg.Combo(ui_language_display_names, key='-UI_LANG_COMBO-', size=(32, 1), readonly=True, enable_events=True, expand_x=True), VerticalStrut()],
-            [sg.Combo([], key='gui_scaling', size=(32, 1), readonly=True, enable_events=True, expand_x=True), VerticalStrut()],
+            [sg.Combo(ui_language_display_names, key='-UI_LANG_COMBO-', size=(32, 1), readonly=True, enable_events=True, expand_x=True, right_click_menu=make_reset_menu("-UI_LANG_COMBO-")), VerticalStrut()],
+            [sg.Combo([], key='gui_scaling', size=(32, 1), readonly=True, enable_events=True, expand_x=True, right_click_menu=make_reset_menu("gui_scaling")), VerticalStrut()],
             [VerticalStrut()],
             [VerticalStrut()],
-            [sg.Input(DEFAULT_DOCUMENTS_DIR, key="--default_output_dir", disabled_readonly_background_color=sg.theme_input_background_color(), readonly=True, size=(34, 1), enable_events=True), VerticalStrut()],
-            [sg.Input(KEY_SEEK_STEP, key="--keyboard_seek_step", size=(10, 1), enable_events=True), VerticalStrut()],
+            [sg.Input(DEFAULT_DOCUMENTS_DIR, key="--default_output_dir", disabled_readonly_background_color=sg.theme_input_background_color(), readonly=True, size=(34, 1), enable_events=True, right_click_menu=make_reset_menu("--default_output_dir")), VerticalStrut()],
+            [sg.Input(KEY_SEEK_STEP, key="--keyboard_seek_step", size=(10, 1), enable_events=True, right_click_menu=make_reset_menu("--keyboard_seek_step")), VerticalStrut()],
             [VerticalStrut()],
             [VerticalStrut()],
             [sg.Button("Check Now", key="-BTN-CHECK_UPDATE_MANUAL-")],
@@ -2405,7 +2646,11 @@ tab2_content = [
             [VerticalStrut()],
             [VerticalStrut()],
         ], pad=(0, None), expand_x=True),
-    ]
+    ],
+    [sg.Push(),
+     sg.Button("Reset to Defaults", key="-RESET_VIDEOCR_SETTINGS-", pad=((5, 5), (15, 3))),
+     sg.Button("Info", key="-RESET_VIDEOCR_SETTINGS_INFO-", pad=((5, 5), (15, 3))),
+     sg.Push()],
 ]
 tab2_layout = [[sg.Column(tab2_content,
                            key='-TAB2_COL-',
@@ -2486,10 +2731,10 @@ def get_work_area() -> tuple[int, int]:
         return width, int(height * 0.90)
 
 
-def stretch_scrollable_col(col_key: str) -> None:
+def stretch_scrollable_col(col_key: str, max_height: int | None = None) -> None:
     """
-    Unlocks a PySimpleGUI scrollable column, stretches its hidden canvas viewport
-    to fit the dynamically resized contents, and restores its original propagation state.
+    Resizes a scrollable column to fit its contents, optionally capped at max_height.
+    Restores the column's original pack propagation state afterward.
     """
     col: sg.Element = window[col_key]
 
@@ -2503,9 +2748,10 @@ def stretch_scrollable_col(col_key: str) -> None:
                 scrollregion = child.cget("scrollregion")
                 if scrollregion:
                     true_inner_height: int = int(scrollregion.split()[3])
+                    target_height = min(true_inner_height, max_height) if max_height is not None else true_inner_height
 
-                    child.config(height=true_inner_height)
-                    col.TKColFrame.config(height=true_inner_height)
+                    child.config(height=target_height)
+                    col.TKColFrame.config(height=target_height)
                 break
 
         col.TKColFrame.pack_propagate(original_propagate)
@@ -2525,7 +2771,11 @@ window.refresh()
 window['-TAB1_COL-'].contents_changed()
 window['-TAB2_COL-'].contents_changed()
 stretch_scrollable_col('-TAB1_COL-')
-stretch_scrollable_col('-TAB2_COL-')
+window.refresh()
+
+# Cap tab2 (Advanced Settings) at tab1's height
+tab1_height = window['-TAB1_COL-'].TKColFrame.winfo_reqheight()
+stretch_scrollable_col('-TAB2_COL-', max_height=tab1_height)
 window.refresh()
 
 # Reposition window
@@ -2550,6 +2800,14 @@ else:
         new_y = (work_height - total_outer_height) // 2
         window.move(x, new_y)
         window.refresh()
+
+# Register elements for Drag & Drop
+if sys.platform == "win32":
+    try:
+        dnd.register_element_dnd(window['-VIDEO-LIST-'], window, dnd.DROP_TYPE_FILES)
+        dnd.register_element_dnd(window['-GRAPH-'], window, dnd.DROP_TYPE_FILES)
+    except Exception as e:
+        log_error(f"Could not register Drag and Drop: {e}")
 
 # --- Load settings when the application starts ---
 load_settings(window)
@@ -2772,6 +3030,7 @@ KEYS_TO_AUTOSAVE = [
     '--brightness_threshold',
     '--ssim_threshold',
     '--ocr_image_max_width',
+    '--disable_stitching',
     '--frames_to_skip',
     '--use_fullframe',
     '--use_gpu',
@@ -2783,6 +3042,8 @@ KEYS_TO_AUTOSAVE = [
     '--post_processing',
     '--min_subtitle_duration',
     '--use_server_model',
+    '--save_ocr_images',
+    '--ocr_images_output_dir',
     '--keyboard_seek_step',
     '--default_output_dir',
     '--save_in_video_dir',
@@ -2796,6 +3057,9 @@ KEYS_TO_AUTOSAVE = [
 ]
 
 window.is_drawing = False
+
+brightness_last_event_time = 0.0
+pending_brightness_update = False
 
 # --- Event Loop ---
 while True:
@@ -2858,7 +3122,6 @@ while True:
                     window['-BTN-CANCEL-'].update(disabled=True)
                     window['-BTN-BATCH-STOP-'].update(disabled=True)
                     window['-SAVE_AS_BTN-'].update(disabled=not video_path)
-                    window['--output'].update(disabled=not video_path)
                     window['-PROGRESS-BAR-'].update(0)
                     window['-STATUS-LINE-'].update("")
                     window['-ETA-LINE-'].update("")
@@ -2880,24 +3143,31 @@ while True:
         except queue.Empty:
             pass
 
+    if pending_brightness_update and (time.time() - brightness_last_event_time > 0.5):
+        pending_brightness_update = False
+        if video_path and video_duration_ms > 0:
+            bt = get_valid_brightness_threshold(values.get('--brightness_threshold'))
+            current_image_bytes, res_w, res_h, off_x, off_y = video_manager.get_frame(current_time_ms, graph_size, brightness_threshold=bt)
+
+            if current_image_bytes:
+                resized_frame_width, resized_frame_height = res_w, res_h
+                image_offset_x, image_offset_y = off_x, off_y
+                redraw_canvas_and_boxes()
+
     # --- Save settings ---
     if event in KEYS_TO_AUTOSAVE:
         if values is not None:
             save_settings(window, values)
 
         if event == '--brightness_threshold':
-            if video_path and video_duration_ms > 0:
-                bt = get_valid_brightness_threshold(values.get('--brightness_threshold'))
-                img_bytes, res_w, res_h, off_x, off_y = video_manager.get_frame(current_time_ms, graph_size, brightness_threshold=bt)
-
-                if img_bytes:
-                    resized_frame_width, resized_frame_height = res_w, res_h
-                    image_offset_x, image_offset_y = off_x, off_y
-                    current_image_bytes = img_bytes.getvalue()
-                    redraw_canvas_and_boxes()
+            brightness_last_event_time = time.time()
+            pending_brightness_update = True
 
         if event in ('enable_subtitle_alignment', '--use_dual_zone'):
             update_alignment_controls(window, values)
+
+        if event == '--save_ocr_images':
+            update_ocr_images_controls(window, values)
 
         if event == '--use_dual_zone' or event == '--use_fullframe':
             reset_crop_state()
@@ -2996,55 +3266,74 @@ while True:
                 log_error(f"Exception during final process kill: {e}")
         break
 
+    # --- Handle "Reset to Defaults" section buttons ---
+    elif event in ('-RESET_OCR_SETTINGS-', '-RESET_VIDEOCR_SETTINGS-'):
+        title = LANG.get('title_reset_settings', "Reset Settings")
+        message = LANG.get('msg_reset_settings', "This will reset all settings in this section back to their default values.\nDo you want to continue?")
+        reset_choice = custom_popup_yes_no(window, title, message, icon=ICON_PATH)
+
+        if reset_choice == 'Yes':
+            keys_to_reset = OCR_SETTINGS_RESET_KEYS if event == '-RESET_OCR_SETTINGS-' else VIDEOCR_SETTINGS_RESET_KEYS
+            if reset_settings_to_default(window, keys_to_reset):
+                break
+
+    # --- Handle "Reset to Defaults" info buttons ---
+    elif event in ('-RESET_OCR_SETTINGS_INFO-', '-RESET_VIDEOCR_SETTINGS_INFO-'):
+        custom_popup(window, LANG.get('reset_info', "Reset to Defaults"), LANG.get('reset_message', (
+            "Reset to Defaults restores every setting in this section back to its default value.\n\n"
+            "You can also right-click any individual setting above to reset just that one setting "
+            "to its default value.")),
+            icon=ICON_PATH
+        )
+
+    # --- Handle per-field "Reset to Default" right-click menu entries ---
+    elif isinstance(event, str) and '::' in event and (setting_key := event.rsplit('::', 1)[1]) in OCR_SETTINGS_RESET_KEYS + VIDEOCR_SETTINGS_RESET_KEYS:
+        reset_settings_to_default(window, [setting_key])
+
+    # --- Handle "Copy Command" right-click menu entry (Run / Add to Queue) ---
+    elif isinstance(event, str) and event.endswith('::COPY_CLI_COMMAND'):
+        if not VIDEOCR_PATH:
+            window['-OUTPUT-'].update(LANG.get('error_cli_not_found', "\nError: videocr-cli not found. Please check the path.\n"), append=True)
+        elif not video_path:
+            window['-OUTPUT-'].update(LANG.get('error_no_video_for_copy', "\nSelect a video first to build its command.\n"), append=True)
+        else:
+            args, errors = get_processing_args(values, window)
+            if errors or args is None:
+                errors_to_display = errors if errors is not None else ["Unknown validation error"]
+                window['-OUTPUT-'].update(LANG.get('val_err_header', "Validation Errors:\n"), append=True)
+                for error in errors_to_display:
+                    window['-OUTPUT-'].update(f"- {error}\n", append=True)
+            else:
+                command = build_cli_command(args)
+                sg.clipboard_set(command_to_shell_string(command))
+                window['-OUTPUT-'].update(LANG.get('msg_command_copied', "Command copied to clipboard.\n"), append=True)
+            window.refresh()
+
     # --- Handle UI language change ---
     elif event == '-UI_LANG_COMBO-':
-        selected_native_name = values['-UI_LANG_COMBO-']
-        lang_code = available_languages.get(selected_native_name)
-
-        if lang_code:
-            current_resume_text = LANG.get('btn_resume', "Resume")
-            was_paused = window['-BTN-PAUSE-'].get_text() == current_resume_text
-
-            selected_pos_display_name = values['-SUBTITLE_POS_COMBO-']
-            pos_display_to_internal_map = {LANG.get(lang_key, lang_key): internal_val for lang_key, internal_val in SUBTITLE_POSITIONS_LIST}
-            saved_internal_pos = pos_display_to_internal_map.get(selected_pos_display_name, DEFAULT_INTERNAL_SUBTITLE_POSITION)
-
-            load_language(lang_code)
-            update_gui_text(window, is_paused=was_paused)
-
-            update_subtitle_pos_combo(window, saved_internal_pos)
-
-            if video_path:
-                update_time_display(window, current_time_ms, video_duration_ms)
+        apply_ui_language_change(window, values['-UI_LANG_COMBO-'])
 
     # --- Handle UI scaling change ---
     elif event == 'gui_scaling':
-        title = LANG.get('title_restart', "Restart Required")
-        message = LANG.get('msg_restart_scaling', "The scaling factor has been updated.\nWould you like to restart the application now to apply this change?")
-        restart_choice = custom_popup_yes_no(window, title, message, icon=ICON_PATH)
-
-        if restart_choice == 'Yes':
-            video_manager.close()
-            set_system_awake(False)
-
-            process_to_kill = getattr(window, '_videocr_process_pid', None)
-            if process_to_kill:
-                try:
-                    kill_process_tree(process_to_kill)
-                except Exception as e:
-                    log_error(f"Exception during restart process kill: {e}")
-
-            if sys.argv[0].endswith('.py') or sys.argv[0].endswith('.pyw'):
-                # Uncompiled: Needs the python interpreter + script name
-                restart_cmd = [sys.executable] + sys.argv
-            else:
-                # Compiled: sys.argv[0] is already the compiled executable
-                restart_cmd = sys.argv
-
-            subprocess.Popen(restart_cmd)
+        if apply_gui_scaling_change(window, values['gui_scaling']):
             break
 
     # --- File/Folder Handling ---
+    elif dnd.is_drop_event(event):
+        if event.key in ('-VIDEO-LIST-', '-GRAPH-'):
+
+            if os.path.isdir(values[event]):
+                videos = scan_video_folder(values[event])
+                if videos:
+                    window['-VIDEO-LIST-'].update(value=videos[0], values=videos, size=(38, None), disabled=False)
+                    window.write_event_value('-VIDEO-LIST-', videos[0])
+                else:
+                    custom_popup(window, "No Videos", "No supported videos found in folder.", icon=ICON_PATH)
+
+            elif os.path.isfile(values[event]):
+                window['-VIDEO-LIST-'].update(value=values[event], values=[values[event]], size=(38, None), disabled=False)
+                window.write_event_value('-VIDEO-LIST-', values[event])
+
     elif event == '-BTN-OPEN-FILE-':
         video_file_types = LANG.get('video_file_types', "Video Files")
         all_file_types = LANG.get('all_file_types', "All Files")
@@ -3070,6 +3359,11 @@ while True:
         folder = sg.tk.filedialog.askdirectory()
         if folder:
             window['--default_output_dir'].update(folder)
+
+    elif event == '-BTN-OCR_IMAGES_FOLDER_BROWSE-':
+        folder = sg.tk.filedialog.askdirectory()
+        if folder:
+            window['--ocr_images_output_dir'].update(folder)
 
     elif event == '-BTN-OCR-INFO-':
         custom_popup(window, LANG.get('engine_info', "OCR Engine Information"), LANG.get('engine_message', (
@@ -3169,14 +3463,11 @@ while True:
             current_time_ms = 0.0
 
             bt = get_valid_brightness_threshold(values.get('--brightness_threshold'))
-            img_bytes, res_w, res_h, off_x, off_y = video_manager.get_frame(0, graph_size, brightness_threshold=bt)
+            current_image_bytes, res_w, res_h, off_x, off_y = video_manager.get_frame(current_time_ms, graph_size, brightness_threshold=bt)
 
-            if img_bytes:
-                resized_frame_width = res_w
-                resized_frame_height = res_h
-                image_offset_x = off_x
-                image_offset_y = off_y
-                current_image_bytes = img_bytes.getvalue()
+            if current_image_bytes:
+                resized_frame_width, resized_frame_height = res_w, res_h
+                image_offset_x, image_offset_y = off_x, off_y
 
                 graph.draw_image(data=current_image_bytes, location=(image_offset_x, image_offset_y))
                 window["-SLIDER-"].update(range=(0, video_duration_ms), value=0, disabled=False)
@@ -3197,7 +3488,6 @@ while True:
                     popup_title = LANG.get('error_set_path_title', "Unable to Set Output Path")
                     popup_msg = LANG.get('error_set_path_msg', "Could not automatically generate default output path.\nPlease specify one manually.\nError: {}")
                     custom_popup(window, popup_title, popup_msg.format(e), icon=ICON_PATH)
-                    window['--output'].update("", disabled=False)
                     window['-SAVE_AS_BTN-'].update(disabled=False)
 
                 # --- Auto-load crop box if setting is enabled ---
@@ -3264,18 +3554,21 @@ while True:
         if abs(new_time_ms - current_time_ms) > 50:
             current_time_ms = new_time_ms
             bt = get_valid_brightness_threshold(values.get('--brightness_threshold'))
-            img_bytes, res_w, res_h, off_x, off_y = video_manager.get_frame(current_time_ms, graph_size, brightness_threshold=bt)
+            current_image_bytes, res_w, res_h, off_x, off_y = video_manager.get_frame(current_time_ms, graph_size, brightness_threshold=bt)
 
-            if img_bytes:
+            if current_image_bytes:
                 resized_frame_width, resized_frame_height = res_w, res_h
                 image_offset_x, image_offset_y = off_x, off_y
-                current_image_bytes = img_bytes.getvalue()
 
                 redraw_canvas_and_boxes()
                 update_time_display(window, current_time_ms, video_duration_ms)
 
     # --- Handle Keyboard Arrow Keys (Bound to Graph) ---
     elif event in ('-GRAPH-<Left>', '-GRAPH-<Right>'):
+        focused_element = window.find_element_with_focus()
+        if isinstance(focused_element, (sg.Input, sg.Multiline)):
+            continue
+
         if video_path and video_duration_ms > 0:
             current_time = float(values["-SLIDER-"])
             try:
@@ -3297,6 +3590,7 @@ while True:
     # --- Graph Interaction ---
     elif event == "-GRAPH-":
         window.is_drawing = True
+        window['-GRAPH-'].set_focus()
 
         if not video_path or resized_frame_width == 0:
             continue
@@ -3872,9 +4166,9 @@ while True:
 
             orig_w, orig_h, duration_ms = video_manager.open(v_path).values()
             bt = get_valid_brightness_threshold(args.get('brightness_threshold'))
-            img_bytes, res_w, res_h, off_x, off_y = video_manager.get_frame(0, graph_size, brightness_threshold=bt)
+            current_image_bytes, res_w, res_h, off_x, off_y = video_manager.get_frame(current_time_ms, graph_size, brightness_threshold=bt)
 
-            if img_bytes and duration_ms > 0:
+            if current_image_bytes and duration_ms > 0:
                 video_path = v_path
                 original_frame_width = orig_w
                 original_frame_height = orig_h
@@ -3884,7 +4178,6 @@ while True:
                 resized_frame_height = res_h
                 image_offset_x = off_x
                 image_offset_y = off_y
-                current_image_bytes = img_bytes.getvalue()
 
                 graph.draw_image(data=current_image_bytes, location=(image_offset_x, image_offset_y))
 
@@ -3916,11 +4209,21 @@ while True:
 
                 # Restore remaining simple arguments
                 for arg_key, arg_val in args.items():
-                    if arg_key in ('ocr_engine', 'lang'):
+                    if arg_key in ('ocr_engine', 'lang', 'subtitle_alignment', 'subtitle_alignment2'):
                         continue
                     gui_key = f"--{arg_key}"
                     if gui_key in window.AllKeysDict:
                         window[gui_key].update(arg_val)
+
+                # Restore subtitle alignment
+                saved_align1 = args.get('subtitle_alignment', DEFAULT_SUBTITLE_ALIGNMENT)
+                saved_align2 = args.get('subtitle_alignment2', DEFAULT_SUBTITLE_ALIGNMENT)
+                window['enable_subtitle_alignment'].update(value='subtitle_alignment' in args)
+                update_alignment_combos(window, get_alignment_index(saved_align1), get_alignment_index(saved_align2))
+
+                current_gui_values = window.read(timeout=0)[1]
+                update_alignment_controls(window, current_gui_values)
+                update_ocr_images_controls(window, current_gui_values)
 
                 new_boxes: list[dict[str, Any]] = []
 

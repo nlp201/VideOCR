@@ -11,10 +11,8 @@ import threading
 from typing import Any, cast
 
 import av
-import fast_ssim  # type: ignore
-import numpy as np
-import wordninja_enhanced as wordninja  # type: ignore
-from PIL import Image
+import fast_ssim
+import wordninja_enhanced as wordninja
 
 from . import utils
 from .models import PredictedFrames, PredictedSubtitle, SubtitleRegionSource
@@ -61,7 +59,8 @@ class Video:
 
     def run_ocr(self, use_gpu: bool, ocr_engine: str, lang: str, use_angle_cls: bool, time_start: str, time_end: str, conf_threshold: int,
                 use_fullframe: bool, brightness_threshold: int | None, ssim_threshold: int, subtitle_position: str, frames_to_skip: int,
-                crop_zones: list[dict[str, int]], ocr_image_max_width: int, normalize_to_simplified_chinese: bool) -> None:
+                crop_zones: list[dict[str, int]], ocr_image_max_width: int, disable_stitching: bool, normalize_to_simplified_chinese: bool,
+                save_ocr_images: bool, ocr_images_output_dir: str) -> None:
         conf_threshold_ratio = conf_threshold / 100
         ssim_threshold_ratio = ssim_threshold / 100
         self.lang = lang
@@ -252,34 +251,50 @@ class Video:
                             buffer_node = graph.add_buffer(template=raw_frame)
                             num_zones = len(self.validated_zones)
 
-                            if num_zones == 1:
-                                # Single Zone (User crop, Bottom Third, Full Frame)
-                                # Pipeline: Buffer -> Crop -> Scale -> Sink
-                                z = self.validated_zones[0]
+                            if num_zones == 2:
+                                main_split = graph.add("split", "2")
+                                buffer_node.link_to(main_split)
+
+                            for i, z in enumerate(self.validated_zones):
                                 crop_node = graph.add("crop", z['crop_str'])
-                                scale_node = graph.add("scale", z['scale_str'])
+
+                                if num_zones == 2:
+                                    main_split.link_to(crop_node, output_idx=i)
+                                else:
+                                    buffer_node.link_to(crop_node)
+
+                                last = graph.add("scale", z['scale_str'])
+                                crop_node.link_to(last)
+
+                                fmt_base_node = graph.add("format", "rgb24")
+                                last.link_to(fmt_base_node)
+                                last = fmt_base_node
+
+                                if brightness_threshold is not None:
+                                    thresh_split = graph.add("split", "2")
+                                    last.link_to(thresh_split)
+
+                                    gray_node = graph.add("format", "gray")
+                                    thresh_split.link_to(gray_node, output_idx=0)
+
+                                    lut_node = graph.add("lut", f"c0='255*gt(val,{brightness_threshold})'")
+                                    gray_node.link_to(lut_node)
+
+                                    mask_rgb_node = graph.add("format", "rgb24")
+                                    lut_node.link_to(mask_rgb_node)
+
+                                    blend_node = graph.add("blend", "all_mode=multiply")
+                                    thresh_split.link_to(blend_node, output_idx=1)
+                                    mask_rgb_node.link_to(blend_node, input_idx=1)
+                                    last = blend_node
+
+                                    fmt_out_node = graph.add("format", "rgb24")
+                                    last.link_to(fmt_out_node)
+                                    last = fmt_out_node
+
                                 sink_node = graph.add("buffersink")
-
-                                buffer_node.link_to(crop_node)
-                                crop_node.link_to(scale_node)
-                                scale_node.link_to(sink_node)
+                                last.link_to(sink_node)
                                 sinks.append(sink_node)
-
-                            elif num_zones == 2:
-                                # Dual Zone
-                                # Pipeline: Buffer -> Split -> (Crop -> Scale -> Sink) x 2
-                                split_node = graph.add("split", "2")
-                                buffer_node.link_to(split_node)
-
-                                for i, z in enumerate(self.validated_zones):
-                                    crop_node = graph.add("crop", z['crop_str'])
-                                    scale_node = graph.add("scale", z['scale_str'])
-                                    sink_node = graph.add("buffersink")
-
-                                    split_node.link_to(crop_node, output_idx=i)
-                                    crop_node.link_to(scale_node)
-                                    scale_node.link_to(sink_node)
-                                    sinks.append(sink_node)
 
                             graph.configure()
 
@@ -288,28 +303,19 @@ class Video:
                         for idx, sink in enumerate(sinks):
                             processed_raw_frame = cast(av.VideoFrame, sink.pull())
 
-                            img = utils.frame_to_array(processed_raw_frame, fmt='rgb24')
+                            img = utils.video_frame_to_frame(processed_raw_frame)
                             zone_idx = idx
-
-                            if brightness_threshold is not None:
-                                gray = (
-                                    (img[..., 0].astype(np.uint16) * 77 +
-                                    img[..., 1].astype(np.uint16) * 150 +
-                                    img[..., 2].astype(np.uint16) * 29) >> 8
-                                ).astype(np.uint8)
-                                mask = gray > brightness_threshold
-                                img *= mask[..., None]
 
                             sample = None
                             if ssim_threshold_ratio < 1:
-                                w = img.shape[1]
+                                w = img.width
                                 if subtitle_position == "center":
                                     w_margin = int(w * 0.35)
-                                    sample = img[:, w_margin:w - w_margin]
+                                    sample = img.crop_columns(w_margin, w - w_margin)
                                 elif subtitle_position == "left":
-                                    sample = img[:, :int(w * 0.3)]
+                                    sample = img.crop_columns(0, int(w * 0.3))
                                 elif subtitle_position == "right":
-                                    sample = img[:, int(w * 0.7):]
+                                    sample = img.crop_columns(int(w * 0.7), w)
                                 elif subtitle_position == "any":
                                     sample = img
                                 else:
@@ -338,12 +344,13 @@ class Video:
                             continue
 
                         frame_path, canvas_w, canvas_h, draw_instructions = item
-                        canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+                        canvas = bytearray(canvas_h * canvas_w * 3)
                         for img, x, y in draw_instructions:
-                            h, w = img.shape[:2]
-                            canvas[y:y + h, x:x + w] = img
+                            utils.blit(canvas, canvas_w, img, x, y)
 
-                        Image.fromarray(canvas).save(frame_path, quality=80)
+                        jpeg_bytes = utils.encode_frame_to_jpeg(canvas, canvas_w, canvas_h, quality=80)
+                        with open(frame_path, 'wb') as f:
+                            f.write(jpeg_bytes)
 
                 except Exception as e:
                     error_list.append(e)
@@ -369,11 +376,16 @@ class Video:
             MAX_STITCH_WIDTH = 1500
             MAX_STITCH_HEIGHT = 1500
             GRID_SPACING = 10
+            MAX_STITCH_COLS = 3
+            MAX_STITCH_ROWS = 10
             FILENAME_ZERO_PADDING = 8
 
             batch_limits: dict[int, int] = {}
             for z_idx, z in enumerate(self.validated_zones):
-                batch_limits[z_idx] = utils.get_batch_limit(z['w'], z['h'], MAX_STITCH_WIDTH, MAX_STITCH_HEIGHT, GRID_SPACING)
+                if disable_stitching:
+                    batch_limits[z_idx] = 1
+                else:
+                    batch_limits[z_idx] = utils.get_batch_limit(z['w'], z['h'], MAX_STITCH_WIDTH, MAX_STITCH_HEIGHT, GRID_SPACING, MAX_STITCH_COLS, MAX_STITCH_ROWS)
 
             def flush_batch(batch: list[Any], counter: int, zone_idx: int, prefix: str, out_dir: str, target_map: dict[str, Any]) -> int:
                 queue_args = utils.prepare_stitch_batch(batch, counter, zone_idx, prefix, out_dir, target_map, MAX_STITCH_WIDTH, GRID_SPACING, FILENAME_ZERO_PADDING)
@@ -381,8 +393,9 @@ class Video:
                 return counter + 1
 
             # Consumer Logic
-            det_stitched_dir = os.path.join(temp_dir, "det_stitched")
-            os.makedirs(det_stitched_dir, exist_ok=True)
+            base_dir = ocr_images_output_dir if save_ocr_images else temp_dir
+            det_stitched_dir = os.path.join(base_dir, "detection_input")
+            utils.make_clean_ocr_image_dir(det_stitched_dir)
 
             det_stitch_map: dict[str, list[dict[str, Any]]] = {}
             det_counter = 0
@@ -435,7 +448,7 @@ class Video:
 
                                     if ssim_threshold_ratio < 1:
                                         if prev_samples[zone_idx] is not None:
-                                            score = fast_ssim.ssim(prev_samples[zone_idx], sample, data_range=255)
+                                            score = fast_ssim.ssim(prev_samples[zone_idx].data, sample.data, sample.width, sample.height, channels=3, data_range=255)
                                             if score > ssim_threshold_ratio:
                                                 prev_samples[zone_idx] = sample
                                                 continue
@@ -527,39 +540,48 @@ class Video:
             total_stitched_frames = sum(len(mappings) for mappings in det_stitch_map.values())
             print(f"Running Text-Detection-Only pass on {total_stitched_frames} filtered frame(s) stitched into {det_counter} image grid(s)...", flush=True)
 
-            det_res_dir = os.path.join(temp_dir, "det_results")
-            os.makedirs(det_res_dir, exist_ok=True)
-
             args = [
                 self.paddleocr_path,
                 "text_detection",
                 "--input", det_stitched_dir,
                 "--model_dir", self.det_model_dir,
-                "--model_name", os.path.basename(self.det_model_dir),
-                "--save_path", det_res_dir
+                "--model_name", os.path.basename(self.det_model_dir)
             ]
+
+            if save_ocr_images:
+                det_save_dir = os.path.join(ocr_images_output_dir, "detection_output")
+                utils.make_clean_ocr_image_dir(det_save_dir)
+                args += ["--save_path", det_save_dir]
 
             print("Starting PaddleOCR...", flush=True)
 
+            det_ocr_outputs: dict[str, list[Any]] = {}
+            current_image = None
+            det_image_index = 0
+
             for line in utils.stream_cli_process(args, "paddleocr_error.log"):
-                if "ppocr INFO: Processed item" in line:
-                    match = re.search(r"Processed item (\d+)", line)
+                line = line.strip()
+
+                if "ppocr INFO: **********" in line:
+                    match = re.search(r"\*+(.+?)\*+$", line)
                     if match:
-                        current_item = match.group(1)
-                        print(f"\rStep 2/3: Performing Text-Detection on image {current_item} of {det_counter}", end="", flush=True)
+                        current_image = os.path.basename(match.group(1)).strip()
+                        det_ocr_outputs[current_image] = []
+                        det_image_index += 1
+                        print(f"\rStep 2/3: Performing Text-Detection on image {det_image_index} of {det_counter}", end="", flush=True)
+                elif current_image and '[[' in line:
+                    try:
+                        match = re.search(r"ppocr INFO:\s*(\[.+\])", line)
+                        if match:
+                            parsed = ast.literal_eval(match.group(1))
+                            det_ocr_outputs[current_image].append(parsed)
+                    except Exception as e:
+                        print(f"Error parsing detection for {current_image}: {e}", flush=True)
             print()
 
-            # Parse JSON Outputs and unstitch coordinates
             parsed_detections: dict[int, list[Any]] = {0: [], 1: []}
 
-            for json_file in os.listdir(det_res_dir):
-                if not json_file.endswith('.json'):
-                    continue
-
-                with open(os.path.join(det_res_dir, json_file), encoding='utf-8') as f:
-                    data = json.load(f)
-
-                stitched_filename = os.path.basename(data["input_path"])
+            for stitched_filename, det_results in det_ocr_outputs.items():
                 if stitched_filename not in det_stitch_map:
                     continue
 
@@ -568,10 +590,10 @@ class Video:
 
                 temp_polys_dict: dict[int, list[Any]] = {m["frame_idx"]: [] for m in mapping}
 
-                dt_polys = data["dt_polys"]
-                dt_scores = data["dt_scores"]
+                for item in det_results:
+                    poly = item[0]
+                    score = item[1]
 
-                for poly, score in zip(dt_polys, dt_scores):
                     for adjusted_poly, m in utils.unstitch_polygon(poly, mapping):
                         temp_polys_dict[m["frame_idx"]].append({"poly": adjusted_poly, "score": score})
 
@@ -589,8 +611,9 @@ class Video:
             frames_deleted_count = 0
             next_print_target = 15
 
-            rec_images_dir = os.path.join(temp_dir, "rec_images")
-            os.makedirs(rec_images_dir, exist_ok=True)
+            base_dir = ocr_images_output_dir if save_ocr_images else temp_dir
+            rec_images_dir = os.path.join(base_dir, "recognition_input")
+            utils.make_clean_ocr_image_dir(rec_images_dir)
 
             empty_frames_meta: set[tuple[int, int]] = set()
             surviving_frames_meta: set[tuple[int, int]] = set()
@@ -681,7 +704,7 @@ class Video:
                         loaded_grids: dict[str, Any] = {}
 
                         with concurrent.futures.ThreadPoolExecutor() as executor:
-                            for g_file, img_array in executor.map(utils.load_grid, chunk_grids):
+                            for g_file, img_array in executor.map(utils.decode_jpeg_to_frame, chunk_grids):
                                 loaded_grids[g_file] = img_array
 
                         group_args = [
@@ -698,7 +721,7 @@ class Video:
 
                                 filename = f"rec_image_{rec_counter:0{FILENAME_ZERO_PADDING}d}_zone{z_idx}.jpg"
                                 filepath = os.path.join(rec_images_dir, filename)
-                                h, w = item["img"].shape[:2]
+                                h, w = item["img"].height, item["img"].width
                                 write_queue.put((filepath, w, h, [(item["img"], 0, 0)]))
 
                                 rec_image_map[filename] = {
@@ -754,6 +777,9 @@ class Video:
             ocr_image_index = 0
 
             if ocr_engine == "google_lens":
+                if save_ocr_images:
+                    print("Note: Google Lens doesn't support saving recognition images yet; only detection images will be saved.", flush=True)
+
                 args = [
                     self.google_lens_path,
                     rec_images_dir,
@@ -825,10 +851,16 @@ class Video:
                     args += ["--textline_orientation_model_dir", self.cls_model_dir]
                     args += ["--textline_orientation_model_name", os.path.basename(self.cls_model_dir)]
 
+                if save_ocr_images:
+                    rec_save_dir = os.path.join(ocr_images_output_dir, "recognition_output")
+                    utils.make_clean_ocr_image_dir(rec_save_dir)
+                    args += ["--save_path", rec_save_dir]
+
                 print("Starting PaddleOCR...", flush=True)
 
                 current_image = None
-                for line in utils.stream_cli_process(args, "paddleocr_error.log"):
+                font_path_env = {"PADDLE_PDX_LOCAL_FONT_FILE_PATH": utils.resolve_font_path(self.lang)} if save_ocr_images else None
+                for line in utils.stream_cli_process(args, "paddleocr_error.log", font_path_env):
                     line = line.strip()
 
                     if "ppocr INFO: **********" in line:

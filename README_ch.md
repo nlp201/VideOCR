@@ -35,6 +35,42 @@
 ./uninstall_videocr.sh
 ```
 
+### Docker:
+VideOCR CLI 也可以完全在 Docker 容器中运行。
+
+#### 环境要求：
+- 系统已安装 **[Docker](https://docs.docker.com/get-docker/)**。
+- **GPU 加速：** 需要 NVIDIA GPU，并且宿主机已安装 **[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)**。
+
+#### 方案 A：从 GitHub Container Registry（GHCR）下载
+GitHub 会自动构建并托管预编译镜像，您无需自行编译即可直接拉取：
+
+- **CPU 版本：**
+  ```bash
+  docker pull ghcr.io/timminator/videocr-cli-cpu:latest
+  ```
+
+- **GPU 版本（CUDA 11.8 - Nvidia 10 系列显卡）：**
+  ```bash
+  docker pull ghcr.io/timminator/videocr-cli-gpu-cuda11.8:latest
+  ```
+
+- **GPU 版本（CUDA 12.9 - Nvidia 16 - 50 系列显卡）：**
+  ```bash
+  docker pull ghcr.io/timminator/videocr-cli-gpu-cuda12.9:latest
+  ```
+
+#### 方案 B：本地构建
+如果您希望自行从源码构建镜像，请克隆仓库并使用提供的 Dockerfile。您可以通过 `BUILD_TARGET` 参数指定硬件目标（`cpu`、`gpu-cuda11.8` 或 `gpu-cuda12.9`）。
+
+```bash
+# 示例：本地构建 CUDA 12.9 GPU 版本
+docker build --build-arg BUILD_TARGET=gpu-cuda12.9 -t videocr-cli-gpu:latest .
+
+# 示例：本地构建 CPU 版本
+docker build --build-arg BUILD_TARGET=cpu -t videocr-cli-cpu:latest .
+```
+
 ## 使用说明
 
 导入视频后，可通过时间轴或左右方向键浏览视频内容。通过点击拖拽的方式在视频上绘制裁剪框，选择字幕区域。完成后，点击“运行”按钮开始字幕提取。
@@ -61,6 +97,30 @@
 .\videocr-cli.exe --video_path "视频路径\example.mp4" --output "字幕保存路径\example.srt" --lang en --time_start "18:40" --use_gpu true
 ```
 更多参数说明请参考下文。
+
+### Docker 示例用法：
+运行 Docker 容器时，必须使用 Docker volume（`-v`）将本地视频目录挂载到容器内的 `/data` 目录，以便应用读取视频并保存 `.srt` 输出文件。
+
+- **GPU 示例：**
+  ```bash
+  docker run --rm -it --gpus all \
+  -v /path/to/your/local/videos:/data \
+  ghcr.io/timminator/videocr-cli-gpu-cuda12.9:latest \
+  --video_path /data/my_video.mp4 \
+  --output /data/my_subtitle.srt \
+  --use_gpu true
+  ```
+
+- **CPU 示例：**
+  ```bash
+  docker run --rm -it \
+  -v /path/to/your/local/videos:/data \
+  ghcr.io/timminator/videocr-cli-cpu:latest \
+  --video_path /data/my_video.mp4 \
+  --output /data/my_subtitle.srt
+  ```
+
+参数章节中列出的所有 CLI 参数都可以追加到 `docker run` 命令末尾。
 
 ## 性能说明
 
@@ -153,6 +213,10 @@
 
   在传递给OCR引擎之前缩小裁剪的图像帧，使其宽度不超过此设定值。较低的数值可缩短处理时间，但设置过低可能会降低OCR识别的准确率。
 
+- `disable_stitching`
+
+  默认情况下，多个经过过滤的帧会在检测阶段之前被拼接为一个图像网格，以加快处理速度。将此参数设为`True`可禁用该行为，转而单独处理每一帧。禁用后可提高准确率，但会降低处理速度。
+
 - `use_gpu`
 
   设为`True`时，使用GPU进行OCR。
@@ -180,6 +244,14 @@
 - `use_server_model`
 
   默认使用轻量模型进行OCR。启用后将使用服务器模型，提升检测效果，但会消耗更多资源。建议仅在GPU版本中使用。
+
+- `save_ocr_images`
+
+  设为 `True` 时，将检测和识别所用的图像保存到磁盘，并标注检测到的框/文字。适用于查看或调试 OCR 结果。识别图像目前仅在使用 `paddleocr` 引擎时保存；`google_lens` 暂不支持。
+
+- `ocr_images_output_dir`
+
+  `save_ocr_images` 保存图像的目标目录。若未指定，默认为当前工作目录下的 `ocr_images`。
 
 ## 构建与编译说明
 

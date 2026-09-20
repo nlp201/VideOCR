@@ -1,5 +1,6 @@
 # Compilation instructions
 # nuitka-project: --standalone
+# nuitka-project: --no-prefer-source-code
 # nuitka-project: --include-windows-runtime-dlls=yes
 # nuitka-project-if: {OS} == "Windows":
 #     nuitka-project: --output-filename=videocr-cli
@@ -42,6 +43,17 @@ def valid_output_path(arg: str) -> str:
         raise argparse.ArgumentTypeError(f"Output directory does not exist: '{dir_name}'")
     if not os.access(dir_name, os.W_OK):
         raise argparse.ArgumentTypeError(f"Output directory is not writable: '{dir_name}'")
+    return arg
+
+
+def valid_output_dir_path(arg: str) -> str:
+    if os.path.exists(arg) and not os.path.isdir(arg):
+        raise argparse.ArgumentTypeError(f"Path exists and is not a directory: '{arg}'")
+    parent_dir = os.path.dirname(os.path.abspath(arg)) or '.'
+    if not os.path.isdir(parent_dir):
+        raise argparse.ArgumentTypeError(f"Parent directory does not exist: '{parent_dir}'")
+    if not os.access(parent_dir, os.W_OK):
+        raise argparse.ArgumentTypeError(f"Parent directory is not writable: '{parent_dir}'")
     return arg
 
 
@@ -95,7 +107,7 @@ def valid_alignment_name(arg: str) -> str | None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Extract subtitles from video using PaddleOCR.')
+    parser = argparse.ArgumentParser(description='Extract subtitles from a video using PaddleOCR or Google Lens.')
 
     parser.add_argument('--video_path', type=valid_video_path, required=True, help='Path to the video file')
     parser.add_argument('--output', type=valid_output_path, default='subtitle.srt', help='Output SRT file path (default: subtitle.srt)')
@@ -112,13 +124,14 @@ def main() -> None:
     parser.add_argument('--use_angle_cls', type=lambda x: x.lower() == 'true', default=False, help='Enable Classification (PaddleOCR only, default: false)')
     parser.add_argument('--use_server_model', type=lambda x: x.lower() == 'true', default=False, help='Enable usage of server model (default: false)')
     parser.add_argument('--brightness_threshold', type=restricted_int(0, 255), default=None, help='Brightness threshold')
-    parser.add_argument('--ssim_threshold', type=restricted_int(0, 100), default=92, help='SSIM similarity threshold for initial frame filtering in Step 1 (default: 92)')
+    parser.add_argument('--ssim_threshold', type=restricted_int(0, 100), default=94, help='SSIM similarity threshold for initial frame filtering in Step 1 (default: 94)')
     parser.add_argument('--subtitle_position', type=str, default='center', help='Subtitle position alignment (center (default), left, right, any)')
     parser.add_argument('--frames_to_skip', type=restricted_int(min_val=0), default=1, help='Frames to skip (default: 1)')
     parser.add_argument('--normalize_to_simplified_chinese', type=lambda x: x.lower() == 'true', default=True, help='Normalize Traditional Chinese characters to Simplified Chinese for ch (default: true)')
     parser.add_argument('--post_processing', type=lambda x: x.lower() == 'true', default=False, help='Enable post processing of subtitles (default: false)')
     parser.add_argument('--min_subtitle_duration', type=restricted_float(min_val=0.0), default=0.2, help='Minimum subtitle duration in seconds (default: 0.2)')
     parser.add_argument('--ocr_image_max_width', type=restricted_int(min_val=1), default=720, help='Maximum image width used for OCR (default: 720)')
+    parser.add_argument('--disable_stitching', type=lambda x: x.lower() == 'true', default=False, help='Disable frame stitching for the detection pass, processing one frame at a time for maximum accuracy at the cost of speed (default: false)')
     parser.add_argument('--crop_x', type=int, default=None, help='(Zone 1) Crop start X')
     parser.add_argument('--crop_y', type=int, default=None, help='(Zone 1) Crop start Y')
     parser.add_argument('--crop_width', type=int, default=None, help='(Zone 1) Crop width')
@@ -130,6 +143,8 @@ def main() -> None:
     parser.add_argument('--subtitle_alignment', type=valid_alignment_name, default=None, help='(Zone 1) Subtitle alignment. Allowed: bottom-left, bottom-center, bottom-right, middle-left, middle-center, middle-right, top-left, top-center, top-right')
     parser.add_argument('--subtitle_alignment2', type=valid_alignment_name, default=None, help='(Zone 2) Subtitle alignment. See --subtitle_alignment for allowed values.')
     parser.add_argument('--allow_system_sleep', type=lambda x: x.lower() == 'true', default=False, help='Allow the system to sleep during processing (default: false)')
+    parser.add_argument('--save_ocr_images', type=lambda x: x.lower() == 'true', default=False, help='Save annotated detection and recognition images to disk. Recognition output is PaddleOCR only; not yet supported for Google Lens (default: false)')
+    parser.add_argument('--ocr_images_output_dir', type=valid_output_dir_path, default='ocr_images', help='Directory to save OCR images to when --save_ocr_images is enabled (default: ocr_images)')
 
     args = parser.parse_args()
 
@@ -173,7 +188,8 @@ def main() -> None:
             elif not is_zone2_empty:
                 raise ValueError("Partial crop coordinates detected for Zone 2. You must provide ALL four: --crop_x2, --crop_y2, --crop_width2, and --crop_height2.")
 
-        keep_awake_manager = nullcontext() if args.allow_system_sleep else keep.running()
+        disable_wakelock = args.allow_system_sleep or utils.is_running_in_container()
+        keep_awake_manager = nullcontext() if disable_wakelock else keep.running()
 
         with keep_awake_manager:
             save_subtitles_to_file(
@@ -200,7 +216,10 @@ def main() -> None:
                 post_processing=args.post_processing,
                 min_subtitle_duration_sec=args.min_subtitle_duration,
                 ocr_image_max_width=args.ocr_image_max_width,
-                subtitle_alignments=[args.subtitle_alignment, args.subtitle_alignment2]
+                disable_stitching=args.disable_stitching,
+                subtitle_alignments=[args.subtitle_alignment, args.subtitle_alignment2],
+                save_ocr_images=args.save_ocr_images,
+                ocr_images_output_dir=args.ocr_images_output_dir
             )
     except ValueError as e:
         print(f"Error: {e}")
