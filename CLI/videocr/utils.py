@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import datetime
 import os
 import re
@@ -7,13 +9,13 @@ import sys
 import tempfile
 import threading
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import IO, Any
 
 import av
-import fast_ssim  # type: ignore
-import numpy as np
+import fast_ssim
+import simplejpeg
 from cpuid import cpuid, xgetbv  # type: ignore
-from PIL import Image
 
 from .lang_dictionaries import PADDLEOCR_LANGS
 from .models import PredictedText
@@ -24,6 +26,96 @@ ALIGNMENT_MAP = {
     'top-left': 'an7', 'top-center': 'an8', 'top-right': 'an9',
 }
 VALID_ALIGNMENT_NAMES = set(ALIGNMENT_MAP.keys())
+
+
+@dataclass
+class Frame:
+    """Thin wrapper around a packed HxWx3 uint8 buffer (flat, row-major:
+    len(data) == height * width * 3)."""
+    data: bytes | bytearray | memoryview
+    height: int
+    width: int
+
+    def _row_bytes(self) -> int:
+        """Calculates the total number of bytes in a single row."""
+        return self.width * 3
+
+    def row(self, r: int) -> memoryview:
+        """Extracts a single row of pixels as a memoryview."""
+        rb = self._row_bytes()
+        return memoryview(self.data)[r * rb:(r + 1) * rb]
+
+    def crop_columns(self, x0: int, x1: int) -> Frame:
+        """Crops the image vertically, returning a new Frame containing columns from x0 to x1."""
+        rb = self._row_bytes()
+        crop_w_bytes = (x1 - x0) * 3
+        mv = memoryview(self.data)
+        out = bytearray(crop_w_bytes * self.height)
+
+        for r in range(self.height):
+            src_off = r * rb + x0 * 3
+            dst_off = r * crop_w_bytes
+            out[dst_off:dst_off + crop_w_bytes] = mv[src_off:src_off + crop_w_bytes]
+
+        return Frame(out, self.height, x1 - x0)
+
+    def crop_rect(self, x0: int, y0: int, x1: int, y1: int) -> Frame:
+        """Extracts a specific rectangular region and returns it as a new Frame."""
+        rb = self._row_bytes()
+        crop_w = max(0, x1 - x0)
+        crop_h = max(0, y1 - y0)
+        crop_w_bytes = crop_w * 3
+        mv = memoryview(self.data)
+        out = bytearray(crop_w_bytes * crop_h)
+
+        for row_idx, r in enumerate(range(y0, y1)):
+            src_off = r * rb + x0 * 3
+            dst_off = row_idx * crop_w_bytes
+            out[dst_off:dst_off + crop_w_bytes] = mv[src_off:src_off + crop_w_bytes]
+
+        return Frame(out, crop_h, crop_w)
+
+    def copy(self) -> Frame:
+        """Returns a deep copy of the frame's buffer."""
+        return Frame(bytes(self.data), self.height, self.width)
+
+
+def video_frame_to_frame(frame: av.VideoFrame) -> Frame:
+    """Converts an RGB24 frame to a contiguous Frame, removing any row-stride padding."""
+    plane = frame.planes[0]
+    stride = plane.line_size
+    width_bytes = frame.width * 3
+    mv = memoryview(plane)
+
+    if stride == width_bytes:
+        data = bytes(mv)
+    else:
+        rows = [mv[r * stride: r * stride + width_bytes] for r in range(frame.height)]
+        data = b''.join(rows)
+
+    return Frame(data, frame.height, frame.width)
+
+
+def blit(canvas: bytearray, canvas_w: int, img: Frame, x: int, y: int) -> None:
+    """Copies an RGB frame into the canvas at (x, y) in place."""
+    row_bytes = img.width * 3
+    canvas_stride = canvas_w * 3
+    for row in range(img.height):
+        dst_off = (y + row) * canvas_stride + x * 3
+        canvas[dst_off:dst_off + row_bytes] = img.row(row)
+
+
+def encode_frame_to_jpeg(canvas: bytearray, canvas_w: int, canvas_h: int, quality: int) -> bytes:
+    """Encodes a flat bytearray to JPEG."""
+    mv = memoryview(canvas).cast('B', shape=(canvas_h, canvas_w, 3))
+    return simplejpeg.encode_jpeg(mv, quality=quality, colorspace='RGB')
+
+
+def decode_jpeg_to_frame(g_file: str) -> tuple[str, Frame]:
+    """Decodes an RGB JPEG file into a Frame."""
+    with open(g_file, 'rb') as f:
+        data, h, w, _ = simplejpeg.decode_jpeg(f.read(), colorspace='RGB', output='bytes')
+    return g_file, Frame(data, h, w)
 
 
 def get_ms_from_time_str(time_str: str) -> float:
@@ -65,20 +157,6 @@ def get_srt_timestamp_from_ms(ms: float) -> str:
     hours, minutes = divmod(minutes, 60)
     milliseconds = td.microseconds // 1000
     return f'{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}'
-
-
-def frame_to_array(frame: av.VideoFrame, fmt: str) -> np.ndarray[Any, Any]:
-    """Converts a frame to an array, safely falls back if threads arg is unsupported."""
-    if not hasattr(frame_to_array, "supports_threads"):
-        frame_to_array.supports_threads = True  # type: ignore
-
-    if frame_to_array.supports_threads:  # type: ignore
-        try:
-            return frame.to_ndarray(format=fmt, threads=1)
-        except TypeError:
-            frame_to_array.supports_threads = False  # type: ignore
-
-    return frame.to_ndarray(format=fmt)
 
 
 def is_on_same_line(word1: PredictedText, word2: PredictedText) -> bool:
@@ -142,43 +220,75 @@ def find_executable(program_name: str) -> str:
 def resolve_model_dirs(lang: str, use_server_model: bool) -> tuple[str, str, str]:
     """Resolves the model directory for the specified language and mode."""
     program_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
-    base_path = os.path.join(program_dir, "PaddleOCR.PP-OCRv5.support.files")
+    base_path = os.path.join(program_dir, "PaddleOCR.PP-OCRv6.support.files")
 
     det_path = os.path.join(base_path, "det")
     rec_path = os.path.join(base_path, "rec")
     cls_path = os.path.join(base_path, "cls", "PP-LCNet_x1_0_textline_ori")
 
-    mode = "server" if use_server_model else "mobile"
+    v6_mode = "medium" if use_server_model else "small"
+    legacy_mode = "server" if use_server_model else "mobile"
 
-    # DET
-    if lang == "ka":
-        det_sub = "PP-OCRv3_mobile_det"
+    is_v6_supported = lang in ("ch", "chinese_cht", "en", "japan") or (lang in PADDLEOCR_LANGS["latin"] and lang != "pi")
+
+    if is_v6_supported:
+        det_sub = f"PP-OCRv6_{v6_mode}_det"
+        rec_sub = f"PP-OCRv6_{v6_mode}_rec"
     else:
-        det_sub = f"PP-OCRv5_{mode}_det"
+        if lang == "ka":
+            det_sub = "PP-OCRv3_mobile_det"
+        else:
+            det_sub = f"PP-OCRv5_{legacy_mode}_det"
 
-    # REC
-    if lang in ("ch", "chinese_cht", "japan"):
-        rec_sub = f"PP-OCRv5_{mode}_rec"
-    elif lang in PADDLEOCR_LANGS["latin"]:
-        rec_sub = "latin_PP-OCRv5_mobile_rec"
-    elif lang in PADDLEOCR_LANGS["arabic"]:
-        rec_sub = "arabic_PP-OCRv5_mobile_rec"
-    elif lang in PADDLEOCR_LANGS["eslav"]:
-        rec_sub = "eslav_PP-OCRv5_mobile_rec"
-    elif lang in PADDLEOCR_LANGS["cyrillic"]:
-        rec_sub = "cyrillic_PP-OCRv5_mobile_rec"
-    elif lang in PADDLEOCR_LANGS["devanagari"]:
-        rec_sub = "devanagari_PP-OCRv5_mobile_rec"
-    elif lang in ("en", "korean", "th", "el", "te", "ta"):
-        rec_sub = f"{lang}_PP-OCRv5_mobile_rec"
-    elif lang == "ka":
-        rec_sub = "ka_PP-OCRv3_mobile_rec"
+        if lang in PADDLEOCR_LANGS["latin"]:
+            rec_sub = "latin_PP-OCRv5_mobile_rec"
+        elif lang in PADDLEOCR_LANGS["arabic"]:
+            rec_sub = "arabic_PP-OCRv5_mobile_rec"
+        elif lang in PADDLEOCR_LANGS["eslav"]:
+            rec_sub = "eslav_PP-OCRv5_mobile_rec"
+        elif lang in PADDLEOCR_LANGS["cyrillic"]:
+            rec_sub = "cyrillic_PP-OCRv5_mobile_rec"
+        elif lang in PADDLEOCR_LANGS["devanagari"]:
+            rec_sub = "devanagari_PP-OCRv5_mobile_rec"
+        elif lang in ("korean", "th", "el", "te", "ta"):
+            rec_sub = f"{lang}_PP-OCRv5_mobile_rec"
+        elif lang == "ka":
+            rec_sub = "ka_PP-OCRv3_mobile_rec"
 
     return (
         os.path.join(det_path, det_sub),
         os.path.join(rec_path, rec_sub),
         cls_path
     )
+
+
+def resolve_font_path(lang: str) -> str:
+    """Resolves the font file for the specified language."""
+    program_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+    font_dir = os.path.join(program_dir, "PaddleOCR.font.support.files")
+
+    is_v6_supported = lang in ("ch", "chinese_cht", "en", "japan") or (lang in PADDLEOCR_LANGS["latin"] and lang != "pi")
+
+    if is_v6_supported:
+        font_name = "simfang.ttf"
+    elif lang in PADDLEOCR_LANGS["latin"]:
+        font_name = "latin.ttf"
+    elif lang in PADDLEOCR_LANGS["arabic"]:
+        font_name = "arabic.ttf"
+    elif lang in PADDLEOCR_LANGS["eslav"] or lang in PADDLEOCR_LANGS["cyrillic"]:
+        font_name = "cyrillic.ttf"
+    elif lang in PADDLEOCR_LANGS["devanagari"]:
+        font_name = "devanagari.ttf"
+    elif lang in ("korean", "th", "el"):
+        font_name = f"{lang}.ttf"
+    elif lang == "te":
+        font_name = "telugu.ttf"
+    elif lang == "ta":
+        font_name = "tamil.ttf"
+    elif lang == "ka":
+        font_name = "kannada.ttf"
+
+    return os.path.join(font_dir, font_name)
 
 
 def perform_hardware_check(paddleocr_path: str, use_gpu: bool) -> None:
@@ -291,6 +401,11 @@ def is_process_running(pid: int) -> bool:
     return False
 
 
+def is_running_in_container() -> bool:
+    """Check if the app is running inside a Docker container."""
+    return os.path.exists('/.dockerenv')
+
+
 def create_clean_temp_dir() -> str:
     """Cleans up orphaned temporary directories from previous crashed runs and creates a fresh one for the current process."""
     current_pid = os.getpid()
@@ -317,6 +432,13 @@ def create_clean_temp_dir() -> str:
     return tempfile.mkdtemp(prefix=temp_prefix)
 
 
+def make_clean_ocr_image_dir(path: str) -> None:
+    """(Re)creates an empty directory for OCR image output, clearing any existing content first."""
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+    os.makedirs(path)
+
+
 def log_error(message: str, log_name: str = "error_log.txt") -> str:
     """Saves errors to a log file."""
     if sys.platform == "win32":
@@ -337,7 +459,7 @@ def log_error(message: str, log_name: str = "error_log.txt") -> str:
 def prepare_stitch_batch(batch: list[Any], counter: int, zone_idx: int, prefix: str, out_dir: str, target_map: dict[str, Any],
                          max_width: int, grid_spacing: int, zero_pad_length: int) -> tuple[str, int, int, list[tuple[Any, int, int]]]:
     """Calculates grid dimensions and maps coordinates for a batch. Returns queue arguments."""
-    h, w = batch[0]["img"].shape[:2]
+    h, w = batch[0]["img"].height, batch[0]["img"].width
     cols = max(1, (max_width + grid_spacing) // (w + grid_spacing))
 
     actual_cols = min(len(batch), cols)
@@ -374,10 +496,11 @@ def prepare_stitch_batch(batch: list[Any], counter: int, zone_idx: int, prefix: 
     return filepath, canvas_w, canvas_h, draw_instructions
 
 
-def get_batch_limit(w: int, h: int, max_width: int, max_height: int, padding: int) -> int:
+def get_batch_limit(w: int, h: int, max_width: int, max_height: int, padding: int, max_cols: int, max_rows: int) -> int:
     """Calculates the maximum number of frames that can fit in a stitched grid."""
-    cols = max(1, (max_width + padding) // (w + padding))
-    rows = max(1, (max_height + padding) // (h + padding))
+    cols = min(max_cols, max(1, (max_width + padding) // (w + padding)))
+    rows = min(max_rows, max(1, (max_height + padding) // (h + padding)))
+
     return cols * rows
 
 
@@ -435,11 +558,13 @@ def unstitch_polygon(poly: list[list[float]], mapping: list[dict[str, Any]]) -> 
     return intersections
 
 
-def stream_cli_process(args: list[str], log_name: str) -> Iterator[str]:
+def stream_cli_process(args: list[str], log_name: str, extra_env: dict[str, str] | None = None) -> Iterator[str]:
     """Executes a CLI process, yields its stdout lines, and handles errors/logging."""
     cli_env = os.environ.copy()
     cli_env["PYTHONIOENCODING"] = "utf-8"
     cli_env["PYTHONUNBUFFERED"] = "1"
+    if extra_env:
+        cli_env.update(extra_env)
 
     process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", env=cli_env, bufsize=1)
 
@@ -536,13 +661,8 @@ def are_rect_lists_similar(rects1: list[list[float]], rects2: list[list[float]],
     return True
 
 
-def load_grid(g_file: str) -> tuple[str, Any]:
-    """Loads a grid image."""
-    return g_file, np.array(Image.open(g_file))
-
-
 def process_ssim_group(union_rects: list[list[float]], group_frames: list[tuple[int, list[list[float]], float, dict[str, Any]]],
-                       loaded_grids: dict[str, Any], ssim_threshold: float) -> tuple[list[dict[str, Any]], int]:
+                       loaded_grids: dict[str, Frame], ssim_threshold: float) -> tuple[list[dict[str, Any]], int]:
     """Processes a group for SSIM, keeping the frame with the highest detection score per contiguous block."""
     local_surviving_items: list[dict[str, Any]] = []
     current_similar_batch: list[dict[str, Any]] = []
@@ -550,14 +670,14 @@ def process_ssim_group(union_rects: list[list[float]], group_frames: list[tuple[
 
     for i, (_, _, det_score, m) in enumerate(group_frames):
         grid_img = loaded_grids[m["grid_file"]]
-        img = grid_img[m["y"]:m["y"] + m["h"], m["x"]:m["x"] + m["w"]]
-        h, w = img.shape[:2]
+        img = grid_img.crop_rect(m["x"], m["y"], m["x"] + m["w"], m["y"] + m["h"])
+        h, w = img.height, img.width
 
         current_crops: list[Any] = []
         for rect in union_rects:
             cx1, cy1 = max(0, int(rect[0])), max(0, int(rect[1]))
             cx2, cy2 = min(w, int(rect[2])), min(h, int(rect[3]))
-            current_crops.append(img[cy1:cy2, cx1:cx2])
+            current_crops.append(img.crop_rect(cx1, cy1, cx2, cy2))
 
         item_dict = {
             "img": img.copy(),
@@ -572,10 +692,10 @@ def process_ssim_group(union_rects: list[list[float]], group_frames: list[tuple[
 
         all_lines_match = True
         for prev_c, curr_c in zip(prev_crops, current_crops):
-            if prev_c.size == 0 or curr_c.size == 0:
+            if prev_c.width == 0 or prev_c.height == 0 or curr_c.width == 0 or curr_c.height == 0:
                 all_lines_match = False
                 break
-            score = fast_ssim.ssim(prev_c, curr_c, data_range=255)
+            score = fast_ssim.ssim(prev_c.data, curr_c.data, curr_c.width, curr_c.height, channels=3, data_range=255)
             if score <= ssim_threshold:
                 all_lines_match = False
                 break
@@ -598,3 +718,47 @@ def process_ssim_group(union_rects: list[list[float]], group_frames: list[tuple[
     local_deleted = len(group_frames) - len(local_surviving_items)
 
     return local_surviving_items, local_deleted
+
+
+def levenshtein_ratio(s1: str, s2: str, score_cutoff: int = 0) -> int:
+    """Calculates a 0-100 Levenshtein similarity ratio."""
+    if s1 == s2:
+        return 100
+
+    len1, len2 = len(s1), len(s2)
+    if len1 == 0 or len2 == 0:
+        return 0
+
+    total_len = len1 + len2
+
+    if score_cutoff > 0:
+        best_possible_distance = abs(len1 - len2)
+        best_possible_score = ((total_len - best_possible_distance) / total_len) * 100
+        if best_possible_score < score_cutoff:
+            return 0
+
+    if len2 > len1:
+        s1, s2 = s2, s1
+        len1, len2 = len2, len1
+
+    prev_row = list(range(len2 + 1))
+    curr_row = [0] * (len2 + 1)
+
+    for i in range(len1):
+        curr_row[0] = i + 1
+        c1 = s1[i]
+        for j in range(len2):
+            cost = 0 if c1 == s2[j] else 2
+            del_cost = prev_row[j + 1] + 1
+            ins_cost = curr_row[j] + 1
+            sub_cost = prev_row[j] + cost
+            best = del_cost
+            if ins_cost < best:
+                best = ins_cost
+            if sub_cost < best:
+                best = sub_cost
+            curr_row[j + 1] = best
+        prev_row, curr_row = curr_row, prev_row
+
+    distance = prev_row[len2]
+    return round(((total_len - distance) / total_len) * 100)
