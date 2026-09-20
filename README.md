@@ -94,6 +94,10 @@ Input Video Quality       | Use lower quality           | Use higher quality  | 
 
   Path for the desired location where the .srt file should be stored.
 
+- `boxes_output`
+
+  Optional path for a JSON file with the full-frame bounding boxes and confidences for representative OCR fragments per subtitle cue. When omitted, only the .srt file is written.
+
 - `ocr_engine`
 
   Select the OCR engine to use for text detection and recognition. Valid values are `paddleocr` (default) and `google_lens`. 
@@ -184,6 +188,19 @@ Input Video Quality       | Use lower quality           | Use higher quality  | 
 - `use_server_model`
 
   By default the smaller model are used for the OCR process. This parameter enables the usage of the server models for OCR. This can result in better text detection at the cost of more processing power. Should only ever be used in the GPU version.
+
+
+## Bounding-box metadata (optional)
+
+Alongside the `.srt` file, VideOCR can emit a JSON sidecar holding the positional metadata of every cue. Enable it with `--boxes_output path/to/out.json` on the CLI, or with `boxes_path="path/to/out.json"` in the `save_subtitles_to_file` Python API.
+
+The JSON uses schema version 2 and describes each cue with:
+- `full-frame-pixels` coordinates: every OCR-image box is mapped back onto the original frame using the exact crop offset and the separate horizontal and vertical crop and target dimensions (both rounded to even numbers).
+- `video-relative-milliseconds` timestamps, quantized the same way as the SRT output rather than as wall-clock time.
+- per-region entries: when a cue spans multiple crop zones, each contributing zone is reported independently, so dual-zone merges keep both regions instead of aliasing to the survivor.
+- per line/word representative fragments and confidence (not every frame), together with each region's frame count.
+
+The JSON and the SRT are staged independently and only published once both are ready, so a failure while generating metadata cannot leave a new SRT beside a stale JSON. `--boxes_output` must not point at the same path as `--output`.
 
 
 ## Build and Compile Instructions

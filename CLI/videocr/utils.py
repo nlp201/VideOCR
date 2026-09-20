@@ -47,6 +47,17 @@ def get_srt_timestamp(frame_index: int, fps: float, offset_ms: float = 0.0) -> s
     return f'{h:02d}:{m:02d}:{s:02d},{ms:03d}'
 
 
+def quantize_timestamp_ms(ms: float) -> int:
+    """Quantize a millisecond value exactly as SRT serialisation does.
+
+    get_srt_timestamp_from_ms() derives its fields from timedelta.seconds and
+    timedelta.microseconds, so this mirrors that truncation. Values are
+    therefore reduced modulo 24 hours, matching the SRT text.
+    """
+    td = datetime.timedelta(milliseconds=ms)
+    return td.seconds * 1_000 + td.microseconds // 1_000
+
+
 def get_srt_timestamp_from_ms(ms: float) -> str:
     """Convert milliseconds into SRT timestamp."""
     td = datetime.timedelta(milliseconds=ms)
