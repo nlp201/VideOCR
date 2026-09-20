@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import os
 import sys
+import tempfile
 
 from . import utils
 from .video import Video
@@ -12,7 +15,12 @@ def save_subtitles_to_file(
         use_fullframe: bool = False, use_gpu: bool = False, use_angle_cls: bool = False, use_server_model: bool = False,
         brightness_threshold: int | None = None, ssim_threshold: int = 92, subtitle_position: str = "center", frames_to_skip: int = 1,
         crop_zones: list[dict[str, int]] | None = None, ocr_image_max_width: int = 720, post_processing: bool = False, min_subtitle_duration_sec: float = 0.2,
-        normalize_to_simplified_chinese: bool = True, subtitle_alignments: list[str | None] | None = None) -> None:
+        normalize_to_simplified_chinese: bool = True, subtitle_alignments: list[str | None] | None = None,
+        boxes_path: str | None = None) -> None:
+
+    if boxes_path and os.path.realpath(boxes_path) == os.path.realpath(file_path):
+        print("Error: --boxes_output must not point at the subtitle output path.", flush=True)
+        sys.exit(1)
 
     if crop_zones is None:
         crop_zones = []
@@ -49,5 +57,40 @@ def save_subtitles_to_file(
         sys.exit(1)
     subtitles = v.get_subtitles(sim_threshold, max_merge_gap_sec, lang, post_processing, min_subtitle_duration_sec, subtitle_alignments)
 
-    with open(file_path, 'w+', encoding='utf-8') as f:
-        f.write(subtitles)
+    if boxes_path:
+        # Build and stage both outputs before publishing either, so a failure
+        # in metadata generation cannot leave a new SRT beside a stale JSON.
+        payload = v.get_boxes_metadata(subtitle_alignments)
+        srt_temp = _stage_text(subtitles, file_path)
+        try:
+            boxes_temp = _stage_text(
+                json.dumps(payload, ensure_ascii=False, indent=1), boxes_path
+            )
+        except BaseException:
+            os.unlink(srt_temp)
+            raise
+        os.replace(srt_temp, file_path)
+        os.replace(boxes_temp, boxes_path)
+    else:
+        with open(file_path, 'w+', encoding='utf-8') as f:
+            f.write(subtitles)
+
+
+def _stage_text(content: str, destination: str) -> str:
+    """Write content to a temporary file beside its destination.
+
+    The caller renames it into place once every output has been staged, so a
+    failure part-way through leaves all existing files untouched.
+    """
+    directory = os.path.dirname(os.path.abspath(destination)) or '.'
+    handle, temp_path = tempfile.mkstemp(dir=directory, suffix='.tmp')
+    try:
+        with os.fdopen(handle, 'w', encoding='utf-8') as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        raise
+    return temp_path

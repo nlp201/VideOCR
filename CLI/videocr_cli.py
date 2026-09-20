@@ -99,6 +99,7 @@ def main() -> None:
 
     parser.add_argument('--video_path', type=valid_video_path, required=True, help='Path to the video file')
     parser.add_argument('--output', type=valid_output_path, default='subtitle.srt', help='Output SRT file path (default: subtitle.srt)')
+    parser.add_argument('--boxes_output', type=valid_output_path, default=None, help='Optional path for a JSON file with full-frame bounding boxes and confidences')
     parser.add_argument('--ocr_engine', type=str, choices=['paddleocr', 'google_lens'], default='paddleocr', help='OCR engine to use in the recognition step (default: paddleocr)')
     parser.add_argument('--lang', type=str, default='en', help='OCR language code (default: en)')
     parser.add_argument('--time_start', type=valid_time_string, default='0:00', help='Start time (MM:SS or HH:MM:SS)')
@@ -178,6 +179,7 @@ def main() -> None:
             save_subtitles_to_file(
                 video_path=args.video_path,
                 file_path=args.output,
+                boxes_path=args.boxes_output,
                 ocr_engine=args.ocr_engine,
                 lang=args.lang,
                 time_start=args.time_start,

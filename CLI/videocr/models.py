@@ -85,8 +85,24 @@ class PredictedFrames:
             self.text = self._converter.convert(self.text)
 
 
+@dataclass(frozen=True)
+class SubtitleRegionSource:
+    """Immutable snapshot of one zone's contribution to a merged subtitle.
+
+    Dual-zone merging mutates the surviving PredictedSubtitle in place, so a
+    reference to it cannot describe the pre-merge state. This captures what is
+    needed for positional metadata before that mutation happens.
+    """
+
+    __slots__ = 'frames', 'output_text', 'zone_index'
+    zone_index: int
+    output_text: str
+    frames: tuple[PredictedFrames, ...]
+
+
 class PredictedSubtitle:
     frames: list[PredictedFrames]
+    merged_parts: tuple[SubtitleRegionSource, ...] | None
     zone_index: int
     sim_threshold: int
     text: str
@@ -96,6 +112,7 @@ class PredictedSubtitle:
     def __init__(self, frames: list[PredictedFrames], zone_index: int, sim_threshold: int, lang: str, language_model: wordninja.LanguageModel | None):
         self.frames = [f for f in frames if f.confidence > 0]
         self.frames.sort(key=lambda frame: frame.start_index)
+        self.merged_parts = None
         self.zone_index = zone_index
         self.sim_threshold = sim_threshold
         self.lang = lang

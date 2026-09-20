@@ -17,7 +17,7 @@ import wordninja_enhanced as wordninja  # type: ignore
 from PIL import Image
 
 from . import utils
-from .models import PredictedFrames, PredictedSubtitle
+from .models import PredictedFrames, PredictedSubtitle, SubtitleRegionSource
 from .pyav_adapter import Capture, get_video_properties
 
 
@@ -147,6 +147,16 @@ class Video:
 
             val_zone['w'] = target_w
             val_zone['h'] = target_h
+            # Keep the exact geometry handed to FFmpeg so OCR-image coordinates
+            # can be mapped back onto the full frame. Both the crop and the
+            # scale are rounded down to even numbers, so the horizontal and
+            # vertical factors must be derived separately.
+            val_zone['ocr_crop_x'] = crop_x
+            val_zone['ocr_crop_y'] = crop_y
+            val_zone['ocr_crop_w'] = crop_w
+            val_zone['ocr_crop_h'] = crop_h
+            val_zone['ocr_target_w'] = target_w
+            val_zone['ocr_target_h'] = target_h
             val_zone['crop_str'] = f"{crop_w}:{crop_h}:{crop_x}:{crop_y}"
             val_zone['scale_str'] = f"{target_w}:{target_h}:flags=area:threads=1"
 
@@ -906,6 +916,121 @@ class Video:
 
         return ''.join(srt_lines)
 
+    def _map_box_to_full_frame(self, bounding_box: list[list[float]], zone_index: int) -> list[list[float]]:
+        """Map an OCR-image quadrilateral back onto full-frame coordinates.
+
+        OCR runs on a cropped and downscaled image, so the engine reports
+        coordinates in that image's space. The crop offset and the horizontal
+        and vertical scale factors are applied separately because both the crop
+        size and the target size are rounded down to even numbers.
+        """
+        zone = self.validated_zones[zone_index]
+        crop_x = zone.get('ocr_crop_x')
+        if crop_x is None:
+            raise RuntimeError(
+                f'Missing OCR geometry for zone {zone_index}; cannot emit full-frame coordinates'
+            )
+
+        x_factor = zone['ocr_crop_w'] / zone['ocr_target_w']
+        y_factor = zone['ocr_crop_h'] / zone['ocr_target_h']
+        crop_y = zone['ocr_crop_y']
+
+        return [
+            [crop_x + point[0] * x_factor, crop_y + point[1] * y_factor]
+            for point in bounding_box
+        ]
+
+    def _describe_region(self, region: SubtitleRegionSource) -> dict[str, Any]:
+        """Describe one zone's contribution to a cue, in full-frame pixels."""
+        frames = [frame for frame in region.frames if frame.confidence > 0] or list(region.frames)
+        matching = [frame for frame in frames if frame.text == region.output_text]
+        best = max(matching or frames, key=lambda frame: frame.confidence)
+
+        lines: list[dict[str, Any]] = []
+        for line in best.lines:
+            words: list[dict[str, Any]] = []
+            points: list[list[float]] = []
+            for word in line:
+                mapped = self._map_box_to_full_frame(word.bounding_box, region.zone_index)
+                points.extend(mapped)
+                words.append({
+                    'text': word.text,
+                    'confidence': round(word.confidence, 4),
+                    'bounding_box': [[round(value, 2) for value in point] for point in mapped],
+                })
+
+            xs = [point[0] for point in points]
+            ys = [point[1] for point in points]
+            lines.append({
+                'raw_text': ' '.join(word.text for word in line),
+                'bbox': {
+                    'x': round(min(xs), 2),
+                    'y': round(min(ys), 2),
+                    'width': round(max(xs) - min(xs), 2),
+                    'height': round(max(ys) - min(ys), 2),
+                },
+                'confidence': round(sum(word.confidence for word in line) / len(line), 4),
+                'words': words,
+            })
+
+        return {
+            'zone_index': region.zone_index,
+            'output_text': region.output_text,
+            'raw_text': best.text,
+            'raw_text_matches_region_output': bool(matching),
+            'representative_frame_index': best.start_index,
+            'representative_time_ms': utils.quantize_timestamp_ms(
+                self.frame_timestamps.get(best.start_index, 0) - self.start_time_offset_ms
+            ),
+            'frame_count': len(region.frames),
+            'lines': lines,
+        }
+
+    def get_boxes_metadata(self, subtitle_alignments: list[str | None] | None = None) -> dict[str, Any]:
+        """Return positional metadata for the cues produced by get_subtitles().
+
+        Must be called after get_subtitles(), which populates self.pred_subs.
+        The OCR engine already yields a bounding box and a confidence value for
+        every recognised text fragment; this exposes that information instead of
+        discarding it during SRT serialisation. Coordinates are mapped back to
+        full-frame pixels, and every zone contributing to a cue is reported.
+        """
+        alignments = subtitle_alignments or [None, None]
+        cues: list[dict[str, Any]] = []
+
+        for index, sub in enumerate(self.pred_subs, 1):
+            if not sub.frames:
+                continue
+
+            start_ms, end_ms = self._get_subtitle_ms_times(sub)
+            regions = sub.merged_parts or _snapshot_regions(sub)
+
+            tag = alignments[sub.zone_index] if sub.zone_index < len(alignments) else None
+            srt_text = f'{{\\{tag}}}{sub.text}' if tag else sub.text
+
+            cues.append({
+                'cue_index': index,
+                'text': sub.text,
+                'srt_text': srt_text,
+                'alignment': tag,
+                'start_ms': utils.quantize_timestamp_ms(start_ms),
+                'end_ms': utils.quantize_timestamp_ms(end_ms),
+                'regions': [self._describe_region(region) for region in regions if region.frames],
+            })
+
+        return {
+            'schema_version': 2,
+            'kind': 'videocr-box-metadata',
+            'video': {
+                'width': self.width,
+                'height': self.height,
+                'duration_ms': self.duration_ms,
+            },
+            'coordinate_space': 'full-frame-pixels',
+            'time_base': 'video-relative-milliseconds',
+            'cues': cues,
+        }
+
     def _generate_subtitles(self, sim_threshold: int, max_merge_gap_sec: float, lang: str, post_processing: bool, min_subtitle_duration_sec: float, subtitle_alignments: list[str | None]) -> None:
         print("Generating subtitles...", flush=True)
 
@@ -997,10 +1122,18 @@ class Video:
                 last_zone_info = self.validated_zones[last_sub.zone_index]
                 current_zone_info = self.validated_zones[current_sub.zone_index]
 
+                # Snapshot both sides before last_sub is mutated below, so
+                # positional metadata can report every contributing zone
+                # instead of only the surviving subtitle.
+                last_parts = _snapshot_regions(last_sub)
+                current_parts = _snapshot_regions(current_sub)
+
                 if current_zone_info['midpoint_y'] < last_zone_info['midpoint_y']:
                     last_sub.text = f"{current_sub.text}\n{last_sub.text}"
+                    last_sub.merged_parts = current_parts + last_parts
                 else:
                     last_sub.text = f"{last_sub.text}\n{current_sub.text}"
+                    last_sub.merged_parts = last_parts + current_parts
 
                 last_sub.frames.extend(current_sub.frames)
                 last_sub.frames.sort(key=lambda f: f.start_index)
@@ -1039,3 +1172,15 @@ class Video:
         next_start_ms, _ = self._get_subtitle_ms_times(next_sub)
         gap_ms = next_start_ms - last_end_ms
         return gap_ms <= (max_merge_gap_sec * 1000)
+
+
+def _snapshot_regions(sub: PredictedSubtitle) -> tuple[SubtitleRegionSource, ...]:
+    """Capture a subtitle's per-zone state before it is mutated by merging."""
+    existing = sub.merged_parts
+    if existing:
+        return existing
+    return (SubtitleRegionSource(
+        zone_index=sub.zone_index,
+        output_text=sub.text,
+        frames=tuple(sub.frames),
+    ),)
